@@ -1454,25 +1454,245 @@ async def create_test_data(current_user = Depends(get_current_user)):
 def init_database_if_needed():
     """Inicializar base de datos si es necesario"""
     try:
-        if DATABASE_URL.startswith("sqlite"):
-            # Verificar si las tablas existen
+        if USE_POSTGRESQL:
+            # PostgreSQL - crear tablas si no existen
+            import psycopg2
+            import psycopg2.extras
+            
+            print("🔧 Verificando tablas PostgreSQL...")
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Verificar si existe la tabla users
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'users'
+                );
+            """)
+            table_exists = cursor.fetchone()[0]
+            
+            if not table_exists:
+                print("🔧 Creando tablas PostgreSQL...")
+                create_postgresql_tables(conn)
+                print("✅ Tablas PostgreSQL creadas")
+            else:
+                print("✅ Tablas PostgreSQL ya existen")
+            
+            conn.close()
+            
+        elif DATABASE_URL.startswith("sqlite"):
+            # SQLite - usar el método existente
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
             if not cursor.fetchone():
-                print("🔧 Inicializando base de datos...")
+                print("🔧 Inicializando base de datos SQLite...")
                 conn.close()
-                # Ejecutar tu script de creación de tablas
                 try:
                     from create_sales_tables import create_all_tables
                     create_all_tables()
-                    print("✅ Base de datos inicializada")
+                    print("✅ Base de datos SQLite inicializada")
                 except ImportError:
                     print("⚠️ Script create_sales_tables.py no encontrado")
             else:
-                print("✅ Base de datos ya existe")
+                print("✅ Base de datos SQLite ya existe")
                 conn.close()
     except Exception as e:
         print(f"⚠️ Error inicializando BD: {e}")
+
+def create_postgresql_tables(conn):
+    """Crear todas las tablas para PostgreSQL"""
+    cursor = conn.cursor()
+    
+    # Tabla ubicaciones
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS locations (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            type VARCHAR(50) NOT NULL,
+            address TEXT,
+            phone VARCHAR(50),
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Tabla usuarios
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            first_name VARCHAR(255) NOT NULL,
+            last_name VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL DEFAULT 'vendedor',
+            location_id INTEGER REFERENCES locations(id),
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Tabla de ventas
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sales (
+            id SERIAL PRIMARY KEY,
+            seller_id INTEGER NOT NULL REFERENCES users(id),
+            location_id INTEGER NOT NULL REFERENCES locations(id),
+            total_amount DECIMAL(10, 2) NOT NULL,
+            receipt_image TEXT,
+            sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status VARCHAR(50) DEFAULT 'completed',
+            notes TEXT,
+            requires_confirmation BOOLEAN DEFAULT FALSE,
+            confirmed BOOLEAN DEFAULT TRUE,
+            confirmed_at TIMESTAMP
+        )
+    ''')
+    
+    # Tabla de items de venta
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sale_items (
+            id SERIAL PRIMARY KEY,
+            sale_id INTEGER NOT NULL REFERENCES sales(id),
+            sneaker_reference_code VARCHAR(255) NOT NULL,
+            brand VARCHAR(255) NOT NULL,
+            model VARCHAR(255) NOT NULL,
+            color VARCHAR(255),
+            size VARCHAR(50) NOT NULL,
+            quantity INTEGER NOT NULL,
+            unit_price DECIMAL(10, 2) NOT NULL,
+            subtotal DECIMAL(10, 2) NOT NULL
+        )
+    ''')
+    
+    # Tabla de métodos de pago
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sale_payments (
+            id SERIAL PRIMARY KEY,
+            sale_id INTEGER NOT NULL REFERENCES sales(id),
+            payment_type VARCHAR(50) NOT NULL,
+            amount DECIMAL(10, 2) NOT NULL,
+            reference VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Tabla de gastos
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS expenses (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            location_id INTEGER NOT NULL REFERENCES locations(id),
+            concept VARCHAR(255) NOT NULL,
+            amount DECIMAL(10, 2) NOT NULL,
+            receipt_image TEXT,
+            expense_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT
+        )
+    ''')
+    
+    # Tabla de solicitudes de transferencia
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transfer_requests (
+            id SERIAL PRIMARY KEY,
+            requester_id INTEGER NOT NULL REFERENCES users(id),
+            source_location_id INTEGER NOT NULL REFERENCES locations(id),
+            destination_location_id INTEGER NOT NULL REFERENCES locations(id),
+            sneaker_reference_code VARCHAR(255) NOT NULL,
+            brand VARCHAR(255) NOT NULL,
+            model VARCHAR(255) NOT NULL,
+            size VARCHAR(50) NOT NULL,
+            quantity INTEGER NOT NULL,
+            purpose VARCHAR(50) NOT NULL,
+            pickup_type VARCHAR(50) NOT NULL,
+            destination_type VARCHAR(50) DEFAULT 'bodega',
+            courier_id INTEGER REFERENCES users(id),
+            warehouse_keeper_id INTEGER REFERENCES users(id),
+            status VARCHAR(50) DEFAULT 'pending',
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            accepted_at TIMESTAMP,
+            picked_up_at TIMESTAMP,
+            delivered_at TIMESTAMP,
+            notes TEXT
+        )
+    ''')
+    
+    # Tabla de solicitudes de descuento
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS discount_requests (
+            id SERIAL PRIMARY KEY,
+            seller_id INTEGER NOT NULL REFERENCES users(id),
+            amount DECIMAL(10, 2) NOT NULL,
+            reason TEXT NOT NULL,
+            status VARCHAR(50) DEFAULT 'pending',
+            administrator_id INTEGER REFERENCES users(id),
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reviewed_at TIMESTAMP,
+            admin_comments TEXT
+        )
+    ''')
+    
+    # Tabla de devoluciones
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS return_requests (
+            id SERIAL PRIMARY KEY,
+            original_transfer_id INTEGER NOT NULL REFERENCES transfer_requests(id),
+            requester_id INTEGER NOT NULL REFERENCES users(id),
+            source_location_id INTEGER NOT NULL REFERENCES locations(id),
+            destination_location_id INTEGER NOT NULL REFERENCES locations(id),
+            sneaker_reference_code VARCHAR(255) NOT NULL,
+            size VARCHAR(50) NOT NULL,
+            quantity INTEGER NOT NULL,
+            courier_id INTEGER REFERENCES users(id),
+            warehouse_keeper_id INTEGER REFERENCES users(id),
+            status VARCHAR(50) DEFAULT 'pending',
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            notes TEXT
+        )
+    ''')
+    
+    # Tabla de notificaciones de devolución
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS return_notifications (
+            id SERIAL PRIMARY KEY,
+            transfer_request_id INTEGER NOT NULL REFERENCES transfer_requests(id),
+            returned_to_location VARCHAR(255) NOT NULL,
+            returned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT,
+            read_by_requester BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Insertar ubicación por defecto
+    cursor.execute(
+        'INSERT INTO locations (name, type, address) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
+        ("Local Principal", "local", "Dirección principal")
+    )
+    
+    # Crear usuario admin por defecto
+    try:
+        from passlib.context import CryptContext
+        pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        admin_password = pwd_ctx.hash("admin123")
+        
+        cursor.execute("SELECT id FROM locations WHERE name = %s", ("Local Principal",))
+        location_result = cursor.fetchone()
+        if location_result:
+            location_id = location_result[0]
+            
+            cursor.execute(
+                '''INSERT INTO users (email, password_hash, first_name, last_name, role, location_id)
+                   VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (email) DO NOTHING''',
+                ("admin@tustockya.com", admin_password, "Admin", "TuStockYa", "administrador", location_id)
+            )
+            print("✅ Usuario admin creado: admin@tustockya.com / admin123")
+    except Exception as e:
+        print(f"⚠️ Error creando usuario admin: {e}")
+    
+    conn.commit()
+    print("✅ Tablas PostgreSQL creadas exitosamente")
 
 # ==================== EJECUTAR APLICACIÓN ====================
 
