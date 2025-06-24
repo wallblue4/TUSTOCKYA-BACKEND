@@ -1258,36 +1258,61 @@ async def get_today_expenses(current_user = Depends(get_current_user)):
             "average_expense": round(float(total_amount) / len(expenses), 2) if expenses else 0
         }
     }
-    
+
 # SOLICITUDES DE TRANSFERENCIA COMPLETAS
 @app.post("/api/v1/transfers/request")
 async def create_transfer_request_complete(
-transfer_data: TransferRequestComplete,
-current_user = Depends(get_current_user)
+    transfer_data: TransferRequestComplete,
+    current_user = Depends(get_current_user)
 ):
     """Solicitar tenis de otro local según requerimientos (siguiendo el flujo del escaneo)"""
     
     if current_user['role'] not in ['vendedor', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden solicitar transferencias")
     
-    conn = sqlite3.connect(DB_PATH)
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
     
     request_timestamp = datetime.now().isoformat()
-    cursor = conn.execute(
-        '''INSERT INTO transfer_requests 
-            (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
-            brand, model, size, quantity, purpose, pickup_type, destination_type, notes, requested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        (current_user['id'], transfer_data.source_location_id, current_user['location_id'],
-            transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
-            transfer_data.size, transfer_data.quantity, transfer_data.purpose,
-            transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, request_timestamp)
-    )
-    request_id = cursor.lastrowid
     
-    # Obtener nombre de la ubicación origen
-    cursor = conn.execute('SELECT name FROM locations WHERE id = ?', (transfer_data.source_location_id,))
-    source_location = cursor.fetchone()
+    if USE_POSTGRESQL:
+        cursor.execute(
+            '''INSERT INTO transfer_requests 
+               (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
+                brand, model, size, quantity, purpose, pickup_type, destination_type, notes, requested_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+            (current_user['id'], transfer_data.source_location_id, current_user['location_id'],
+             transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
+             transfer_data.size, transfer_data.quantity, transfer_data.purpose,
+             transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, request_timestamp)
+        )
+        request_id = cursor.fetchone()[0]
+        
+        # Obtener nombre de la ubicación origen
+        cursor.execute('SELECT name FROM locations WHERE id = %s', (transfer_data.source_location_id,))
+        source_location = cursor.fetchone()
+    else:
+        cursor = conn.execute(
+            '''INSERT INTO transfer_requests 
+               (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
+                brand, model, size, quantity, purpose, pickup_type, destination_type, notes, requested_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (current_user['id'], transfer_data.source_location_id, current_user['location_id'],
+             transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
+             transfer_data.size, transfer_data.quantity, transfer_data.purpose,
+             transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, request_timestamp)
+        )
+        request_id = cursor.lastrowid
+        
+        # Obtener nombre de la ubicación origen
+        cursor = conn.execute('SELECT name FROM locations WHERE id = ?', (transfer_data.source_location_id,))
+        source_location = cursor.fetchone()
     
     conn.commit()
     conn.close()
@@ -1326,27 +1351,53 @@ current_user = Depends(get_current_user)
 async def get_my_transfer_requests(current_user = Depends(get_current_user)):
     """Obtener mis solicitudes de transferencia"""
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute(
+            '''SELECT tr.*, 
+                      sl.name as source_location_name,
+                      dl.name as destination_location_name,
+                      c.first_name as courier_first_name,
+                      c.last_name as courier_last_name,
+                      wk.first_name as warehouse_keeper_first_name,
+                      wk.last_name as warehouse_keeper_last_name
+               FROM transfer_requests tr
+               JOIN locations sl ON tr.source_location_id = sl.id
+               JOIN locations dl ON tr.destination_location_id = dl.id
+               LEFT JOIN users c ON tr.courier_id = c.id
+               LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+               WHERE tr.requester_id = %s
+               ORDER BY tr.requested_at DESC''',
+            (current_user['id'],)
+        )
+        requests = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute(
+            '''SELECT tr.*, 
+                      sl.name as source_location_name,
+                      dl.name as destination_location_name,
+                      c.first_name as courier_first_name,
+                      c.last_name as courier_last_name,
+                      wk.first_name as warehouse_keeper_first_name,
+                      wk.last_name as warehouse_keeper_last_name
+               FROM transfer_requests tr
+               JOIN locations sl ON tr.source_location_id = sl.id
+               JOIN locations dl ON tr.destination_location_id = dl.id
+               LEFT JOIN users c ON tr.courier_id = c.id
+               LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+               WHERE tr.requester_id = ?
+               ORDER BY tr.requested_at DESC''',
+            (current_user['id'],)
+        )
+        requests = [dict(row) for row in cursor.fetchall()]
     
-    cursor = conn.execute(
-        '''SELECT tr.*, 
-                    sl.name as source_location_name,
-                    dl.name as destination_location_name,
-                    c.first_name as courier_first_name,
-                    c.last_name as courier_last_name,
-                    wk.first_name as warehouse_keeper_first_name,
-                    wk.last_name as warehouse_keeper_last_name
-            FROM transfer_requests tr
-            JOIN locations sl ON tr.source_location_id = sl.id
-            JOIN locations dl ON tr.destination_location_id = dl.id
-            LEFT JOIN users c ON tr.courier_id = c.id
-            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
-            WHERE tr.requester_id = ?
-            ORDER BY tr.requested_at DESC''',
-        (current_user['id'],)
-    )
-    requests = [dict(row) for row in cursor.fetchall()]
     conn.close()
     
     # Agregar información adicional a cada solicitud
@@ -1380,8 +1431,8 @@ async def get_my_transfer_requests(current_user = Depends(get_current_user)):
 # SOLICITUDES DE DESCUENTO
 @app.post("/api/v1/discounts/request")
 async def create_discount_request(
-discount_data: DiscountRequestCreate,
-current_user = Depends(get_current_user)
+    discount_data: DiscountRequestCreate,
+    current_user = Depends(get_current_user)
 ):
     """Gestionar descuento en orden de 5 mil pesos +/- según requerimientos"""
     
@@ -1401,15 +1452,30 @@ current_user = Depends(get_current_user)
             detail="El monto del descuento debe ser mayor a $0"
         )
     
-    conn = sqlite3.connect(DB_PATH)
+    if USE_POSTGRESQL:
+        import psycopg2
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+    else:
+        conn = sqlite3.connect(DB_PATH)
     
     request_timestamp = datetime.now().isoformat()
-    cursor = conn.execute(
-        '''INSERT INTO discount_requests (seller_id, amount, reason, requested_at)
-            VALUES (?, ?, ?, ?)''',
-        (current_user['id'], discount_data.amount, discount_data.reason, request_timestamp)
-    )
-    request_id = cursor.lastrowid
+    
+    if USE_POSTGRESQL:
+        cursor.execute(
+            '''INSERT INTO discount_requests (seller_id, amount, reason, requested_at)
+               VALUES (%s, %s, %s, %s) RETURNING id''',
+            (current_user['id'], discount_data.amount, discount_data.reason, request_timestamp)
+        )
+        request_id = cursor.fetchone()[0]
+    else:
+        cursor = conn.execute(
+            '''INSERT INTO discount_requests (seller_id, amount, reason, requested_at)
+               VALUES (?, ?, ?, ?)''',
+            (current_user['id'], discount_data.amount, discount_data.reason, request_timestamp)
+        )
+        request_id = cursor.lastrowid
+    
     conn.commit()
     conn.close()
     
@@ -1436,20 +1502,39 @@ current_user = Depends(get_current_user)
 async def get_my_discount_requests(current_user = Depends(get_current_user)):
     """Obtener mis solicitudes de descuento"""
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute(
+            '''SELECT dr.*, 
+                      a.first_name as admin_first_name,
+                      a.last_name as admin_last_name
+               FROM discount_requests dr
+               LEFT JOIN users a ON dr.administrator_id = a.id
+               WHERE dr.seller_id = %s
+               ORDER BY dr.requested_at DESC''',
+            (current_user['id'],)
+        )
+        requests = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute(
+            '''SELECT dr.*, 
+                      a.first_name as admin_first_name,
+                      a.last_name as admin_last_name
+               FROM discount_requests dr
+               LEFT JOIN users a ON dr.administrator_id = a.id
+               WHERE dr.seller_id = ?
+               ORDER BY dr.requested_at DESC''',
+            (current_user['id'],)
+        )
+        requests = [dict(row) for row in cursor.fetchall()]
     
-    cursor = conn.execute(
-        '''SELECT dr.*, 
-                    a.first_name as admin_first_name,
-                    a.last_name as admin_last_name
-            FROM discount_requests dr
-            LEFT JOIN users a ON dr.administrator_id = a.id
-            WHERE dr.seller_id = ?
-            ORDER BY dr.requested_at DESC''',
-        (current_user['id'],)
-    )
-    requests = [dict(row) for row in cursor.fetchall()]
     conn.close()
     
     # Agregar información de estado a cada solicitud
@@ -1481,27 +1566,44 @@ async def get_my_discount_requests(current_user = Depends(get_current_user)):
 # DEVOLUCIONES
 @app.post("/api/v1/returns/request")
 async def create_return_request(
-return_data: ReturnRequestCreate,
-current_user = Depends(get_current_user)
+    return_data: ReturnRequestCreate,
+    current_user = Depends(get_current_user)
 ):
     """Realizar el mismo flujo para la devolución según requerimientos"""
     
     if current_user['role'] not in ['vendedor', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden solicitar devoluciones")
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    
-    # Verificar que la transferencia original existe y fue entregada
-    cursor = conn.execute(
-        '''SELECT tr.*, sl.name as source_location_name, dl.name as destination_location_name
-            FROM transfer_requests tr
-            JOIN locations sl ON tr.source_location_id = sl.id
-            JOIN locations dl ON tr.destination_location_id = dl.id
-            WHERE tr.id = ? AND tr.requester_id = ? AND tr.status = "delivered"''',
-        (return_data.original_transfer_id, current_user['id'])
-    )
-    original_transfer = cursor.fetchone()
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Verificar que la transferencia original existe y fue entregada
+        cursor.execute(
+            '''SELECT tr.*, sl.name as source_location_name, dl.name as destination_location_name
+               FROM transfer_requests tr
+               JOIN locations sl ON tr.source_location_id = sl.id
+               JOIN locations dl ON tr.destination_location_id = dl.id
+               WHERE tr.id = %s AND tr.requester_id = %s AND tr.status = 'delivered' ''',
+            (return_data.original_transfer_id, current_user['id'])
+        )
+        original_transfer = cursor.fetchone()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        # Verificar que la transferencia original existe y fue entregada
+        cursor = conn.execute(
+            '''SELECT tr.*, sl.name as source_location_name, dl.name as destination_location_name
+               FROM transfer_requests tr
+               JOIN locations sl ON tr.source_location_id = sl.id
+               JOIN locations dl ON tr.destination_location_id = dl.id
+               WHERE tr.id = ? AND tr.requester_id = ? AND tr.status = "delivered"''',
+            (return_data.original_transfer_id, current_user['id'])
+        )
+        original_transfer = cursor.fetchone()
     
     if not original_transfer:
         conn.close()
@@ -1512,17 +1614,32 @@ current_user = Depends(get_current_user)
     
     # Crear solicitud de devolución (intercambiando origen y destino)
     return_timestamp = datetime.now().isoformat()
-    cursor = conn.execute(
-        '''INSERT INTO return_requests 
-            (original_transfer_id, requester_id, source_location_id, destination_location_id,
-            sneaker_reference_code, size, quantity, notes, requested_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        (return_data.original_transfer_id, current_user['id'], 
-            original_transfer['destination_location_id'], original_transfer['source_location_id'],
-            original_transfer['sneaker_reference_code'], original_transfer['size'],
-            original_transfer['quantity'], return_data.notes, return_timestamp)
-    )
-    return_id = cursor.lastrowid
+    
+    if USE_POSTGRESQL:
+        cursor.execute(
+            '''INSERT INTO return_requests 
+               (original_transfer_id, requester_id, source_location_id, destination_location_id,
+                sneaker_reference_code, size, quantity, notes, requested_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+            (return_data.original_transfer_id, current_user['id'], 
+             original_transfer['destination_location_id'], original_transfer['source_location_id'],
+             original_transfer['sneaker_reference_code'], original_transfer['size'],
+             original_transfer['quantity'], return_data.notes, return_timestamp)
+        )
+        return_id = cursor.fetchone()[0]
+    else:
+        cursor = conn.execute(
+            '''INSERT INTO return_requests 
+               (original_transfer_id, requester_id, source_location_id, destination_location_id,
+                sneaker_reference_code, size, quantity, notes, requested_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (return_data.original_transfer_id, current_user['id'], 
+             original_transfer['destination_location_id'], original_transfer['source_location_id'],
+             original_transfer['sneaker_reference_code'], original_transfer['size'],
+             original_transfer['quantity'], return_data.notes, return_timestamp)
+        )
+        return_id = cursor.lastrowid
+    
     conn.commit()
     conn.close()
     
@@ -1554,21 +1671,41 @@ current_user = Depends(get_current_user)
 async def get_return_notifications(current_user = Depends(get_current_user)):
     """Recibir notificación que los tenis fueron devueltos al local solicitado según requerimientos"""
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute(
+            '''SELECT rn.*, tr.sneaker_reference_code, tr.brand, tr.model, tr.size, tr.quantity,
+                      sl.name as source_location_name, dl.name as destination_location_name
+               FROM return_notifications rn
+               JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
+               JOIN locations sl ON tr.source_location_id = sl.id
+               JOIN locations dl ON tr.destination_location_id = dl.id
+               WHERE tr.requester_id = %s
+               ORDER BY rn.created_at DESC''',
+            (current_user['id'],)
+        )
+        notifications = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute(
+            '''SELECT rn.*, tr.sneaker_reference_code, tr.brand, tr.model, tr.size, tr.quantity,
+                      sl.name as source_location_name, dl.name as destination_location_name
+               FROM return_notifications rn
+               JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
+               JOIN locations sl ON tr.source_location_id = sl.id
+               JOIN locations dl ON tr.destination_location_id = dl.id
+               WHERE tr.requester_id = ?
+               ORDER BY rn.created_at DESC''',
+            (current_user['id'],)
+        )
+        notifications = [dict(row) for row in cursor.fetchall()]
     
-    cursor = conn.execute(
-        '''SELECT rn.*, tr.sneaker_reference_code, tr.brand, tr.model, tr.size, tr.quantity,
-                    sl.name as source_location_name, dl.name as destination_location_name
-            FROM return_notifications rn
-            JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
-            JOIN locations sl ON tr.source_location_id = sl.id
-            JOIN locations dl ON tr.destination_location_id = dl.id
-            WHERE tr.requester_id = ?
-            ORDER BY rn.created_at DESC''',
-        (current_user['id'],)
-    )
-    notifications = [dict(row) for row in cursor.fetchall()]
     conn.close()
     
     # Agregar información adicional a cada notificación
@@ -1593,29 +1730,52 @@ async def get_return_notifications(current_user = Depends(get_current_user)):
 
 @app.post("/api/v1/notifications/returns/{notification_id}/mark-read")
 async def mark_return_notification_read(
-notification_id: int,
-current_user = Depends(get_current_user)
+    notification_id: int,
+    current_user = Depends(get_current_user)
 ):
     """Marcar notificación de devolución como leída"""
     
-    conn = sqlite3.connect(DB_PATH)
-    
-    # Verificar que la notificación pertenece al usuario
-    cursor = conn.execute(
-        '''SELECT rn.id FROM return_notifications rn
-            JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
-            WHERE rn.id = ? AND tr.requester_id = ?''',
-        (notification_id, current_user['id'])
-    )
-    
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Notificación no encontrada")
-    
-    conn.execute(
-        'UPDATE return_notifications SET read_by_requester = 1 WHERE id = ?',
-        (notification_id,)
-    )
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Verificar que la notificación pertenece al usuario
+        cursor.execute(
+            '''SELECT rn.id FROM return_notifications rn
+               JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
+               WHERE rn.id = %s AND tr.requester_id = %s''',
+            (notification_id, current_user['id'])
+        )
+        
+        if not cursor.fetchone():
+            conn.close()
+            raise HTTPException(status_code=404, detail="Notificación no encontrada")
+        
+        cursor.execute(
+            'UPDATE return_notifications SET read_by_requester = TRUE WHERE id = %s',
+            (notification_id,)
+        )
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        
+        # Verificar que la notificación pertenece al usuario
+        cursor = conn.execute(
+            '''SELECT rn.id FROM return_notifications rn
+               JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
+               WHERE rn.id = ? AND tr.requester_id = ?''',
+            (notification_id, current_user['id'])
+        )
+        
+        if not cursor.fetchone():
+            conn.close()
+            raise HTTPException(status_code=404, detail="Notificación no encontrada")
+        
+        conn.execute(
+            'UPDATE return_notifications SET read_by_requester = 1 WHERE id = ?',
+            (notification_id,)
+        )
     
     conn.commit()
     conn.close()
@@ -1625,28 +1785,43 @@ current_user = Depends(get_current_user)
         "message": "Notificación marcada como leída",
         "notification_id": notification_id
     }
-
     # ==================== FUNCIONES AUXILIARES PARA TESTING ====================
 
 @app.post("/api/v1/admin/create-test-data")
 async def create_test_data(current_user = Depends(get_current_user)):
     """Crear datos de prueba para testing (solo para desarrollo)"""
-        
+    
     if current_user['role'] != 'administrador':
         raise HTTPException(status_code=403, detail="Solo administradores pueden crear datos de prueba")
     
-    conn = sqlite3.connect(DB_PATH)
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+    else:
+        conn = sqlite3.connect(DB_PATH)
     
     try:
         # Crear una venta de prueba
         sale_timestamp = datetime.now().isoformat()
-        cursor = conn.execute(
-            '''INSERT INTO sales (seller_id, location_id, total_amount, notes, sale_date, confirmed)
-                VALUES (?, ?, ?, ?, ?, ?)''',
-            (current_user['id'], current_user['location_id'], 250.0, 
-                "Venta de prueba", sale_timestamp, 1)
-        )
-        sale_id = cursor.lastrowid
+        
+        if USE_POSTGRESQL:
+            cursor.execute(
+                '''INSERT INTO sales (seller_id, location_id, total_amount, notes, sale_date, confirmed)
+                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id''',
+                (current_user['id'], current_user['location_id'], 250.0, 
+                 "Venta de prueba", sale_timestamp, True)
+            )
+            sale_id = cursor.fetchone()[0]
+        else:
+            cursor = conn.execute(
+                '''INSERT INTO sales (seller_id, location_id, total_amount, notes, sale_date, confirmed)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (current_user['id'], current_user['location_id'], 250.0, 
+                 "Venta de prueba", sale_timestamp, 1)
+            )
+            sale_id = cursor.lastrowid
         
         # Items de la venta de prueba
         test_items = [
@@ -1655,12 +1830,20 @@ async def create_test_data(current_user = Depends(get_current_user)):
         ]
         
         for item in test_items:
-            conn.execute(
-                '''INSERT INTO sale_items (sale_id, sneaker_reference_code, brand, model, color, 
-                                            size, quantity, unit_price, subtotal)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (sale_id, *item, item[6])
-            )
+            if USE_POSTGRESQL:
+                cursor.execute(
+                    '''INSERT INTO sale_items (sale_id, sneaker_reference_code, brand, model, color, 
+                                              size, quantity, unit_price, subtotal)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (sale_id, *item, item[6])
+                )
+            else:
+                conn.execute(
+                    '''INSERT INTO sale_items (sale_id, sneaker_reference_code, brand, model, color, 
+                                              size, quantity, unit_price, subtotal)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (sale_id, *item, item[6])
+                )
         
         # Métodos de pago de prueba
         test_payments = [
@@ -1669,18 +1852,32 @@ async def create_test_data(current_user = Depends(get_current_user)):
         ]
         
         for payment in test_payments:
-            conn.execute(
-                '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
-                    VALUES (?, ?, ?, ?)''',
-                (sale_id, *payment)
-            )
+            if USE_POSTGRESQL:
+                cursor.execute(
+                    '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
+                       VALUES (%s, %s, %s, %s)''',
+                    (sale_id, *payment)
+                )
+            else:
+                conn.execute(
+                    '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
+                       VALUES (?, ?, ?, ?)''',
+                    (sale_id, *payment)
+                )
         
         # Gasto de prueba
-        conn.execute(
-            '''INSERT INTO expenses (user_id, location_id, concept, amount, notes)
-                VALUES (?, ?, ?, ?, ?)''',
-            (current_user['id'], current_user['location_id'], "Almuerzo", 25.0, "Gasto de prueba")
-        )
+        if USE_POSTGRESQL:
+            cursor.execute(
+                '''INSERT INTO expenses (user_id, location_id, concept, amount, notes)
+                   VALUES (%s, %s, %s, %s, %s)''',
+                (current_user['id'], current_user['location_id'], "Almuerzo", 25.0, "Gasto de prueba")
+            )
+        else:
+            conn.execute(
+                '''INSERT INTO expenses (user_id, location_id, concept, amount, notes)
+                   VALUES (?, ?, ?, ?, ?)''',
+                (current_user['id'], current_user['location_id'], "Almuerzo", 25.0, "Gasto de prueba")
+            )
         
         conn.commit()
         
