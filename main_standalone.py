@@ -216,14 +216,23 @@ async def root():
 @app.get("/health")
 async def health():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.execute("SELECT COUNT(*) FROM users")
-        user_count = cursor.fetchone()[0]
+        if USE_POSTGRESQL:
+            import psycopg2
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM users")
+            user_count = cursor.fetchone()[0]
+            cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+            tables = [row[0] for row in cursor.fetchall()]
+            conn.close()
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.execute("SELECT COUNT(*) FROM users")
+            user_count = cursor.fetchone()[0]
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row[0] for row in cursor.fetchall()]
+            conn.close()
         
-        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [row[0] for row in cursor.fetchall()]
-        
-        conn.close()
         db_status = "connected"
     except Exception as e:
         user_count = 0
@@ -235,7 +244,7 @@ async def health():
     return {
         "status": "healthy",
         "environment": environment,
-        "database": f"SQLite ({db_status})" if DATABASE_URL.startswith("sqlite") else f"PostgreSQL ({db_status})",
+        "database": f"SQLite ({db_status})" if not USE_POSTGRESQL else f"PostgreSQL ({db_status})",
         "users": user_count,
         "tables": len(tables),
         "table_list": tables,
@@ -524,10 +533,82 @@ async def get_vendor_dashboard_complete(current_user = Depends(get_current_user)
     if current_user['role'] not in ['vendedor', 'administrador']:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    
-    try:
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Ventas del día (confirmadas y pendientes) - PostgreSQL
+        cursor.execute(
+            '''SELECT 
+                 COUNT(*) as total_sales,
+                 COALESCE(SUM(CASE WHEN confirmed = TRUE THEN total_amount ELSE 0 END), 0) as confirmed_amount,
+                 COALESCE(SUM(CASE WHEN confirmed = FALSE AND requires_confirmation = TRUE THEN total_amount ELSE 0 END), 0) as pending_amount,
+                 COUNT(CASE WHEN confirmed = FALSE AND requires_confirmation = TRUE THEN 1 END) as pending_confirmations
+               FROM sales 
+               WHERE DATE(sale_date) = CURRENT_DATE AND seller_id = %s''',
+            (current_user['id'],)
+        )
+        sales_today = dict(cursor.fetchone())
+        
+        # Métodos de pago del día - PostgreSQL
+        cursor.execute(
+            '''SELECT sp.payment_type, SUM(sp.amount) as total_amount, COUNT(*) as count
+               FROM sale_payments sp
+               JOIN sales s ON sp.sale_id = s.id
+               WHERE DATE(s.sale_date) = CURRENT_DATE AND s.seller_id = %s AND s.confirmed = TRUE
+               GROUP BY sp.payment_type
+               ORDER BY total_amount DESC''',
+            (current_user['id'],)
+        )
+        payment_methods = [dict(row) for row in cursor.fetchall()]
+        
+        # Gastos del día - PostgreSQL
+        cursor.execute(
+            '''SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total
+               FROM expenses 
+               WHERE DATE(expense_date) = CURRENT_DATE AND user_id = %s''',
+            (current_user['id'],)
+        )
+        expenses_today = dict(cursor.fetchone())
+        
+        # Solicitudes pendientes - PostgreSQL
+        cursor.execute(
+            '''SELECT 
+                 COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
+                 COUNT(CASE WHEN status = 'in_transit' THEN 1 END) as in_transit,
+                 COUNT(CASE WHEN status = 'delivered' THEN 1 END) as delivered
+               FROM transfer_requests WHERE requester_id = %s''',
+            (current_user['id'],)
+        )
+        transfer_stats = dict(cursor.fetchone())
+        
+        cursor.execute(
+            '''SELECT 
+                 COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending,
+                 COUNT(CASE WHEN status = 'approved' THEN 1 END) as approved,
+                 COUNT(CASE WHEN status = 'rejected' THEN 1 END) as rejected
+               FROM discount_requests WHERE seller_id = %s''',
+            (current_user['id'],)
+        )
+        discount_stats = dict(cursor.fetchone())
+        
+        # Notificaciones de devolución no leídas - PostgreSQL
+        cursor.execute(
+            '''SELECT COUNT(*) as count 
+               FROM return_notifications rn
+               JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
+               WHERE tr.requester_id = %s AND rn.read_by_requester = FALSE''',
+            (current_user['id'],)
+        )
+        unread_returns = cursor.fetchone()[0]
+        
+    else:
+        # SQLite (código original)
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
         # Ventas del día (confirmadas y pendientes)
         cursor = conn.execute(
             '''SELECT 
@@ -592,78 +673,98 @@ async def get_vendor_dashboard_complete(current_user = Depends(get_current_user)
             (current_user['id'],)
         )
         unread_returns = cursor.fetchone()[0]
-        
-        return {
-            "success": True,
-            "dashboard_timestamp": datetime.now().isoformat(),
-            "vendor_info": {
-                "name": f"{current_user['first_name']} {current_user['last_name']}",
-                "email": current_user['email'],
-                "role": current_user['role'],
-                "location_id": current_user['location_id'],
-                "location_name": f"Local #{current_user['location_id']}"
+    
+    conn.close()
+    
+    return {
+        "success": True,
+        "dashboard_timestamp": datetime.now().isoformat(),
+        "vendor_info": {
+            "name": f"{current_user['first_name']} {current_user['last_name']}",
+            "email": current_user['email'],
+            "role": current_user['role'],
+            "location_id": current_user['location_id'],
+            "location_name": f"Local #{current_user['location_id']}"
+        },
+        "today_summary": {
+            "date": datetime.now().date().isoformat(),
+            "sales": {
+                "total_count": sales_today['total_sales'],
+                "confirmed_amount": float(sales_today['confirmed_amount']),
+                "pending_amount": float(sales_today['pending_amount']),
+                "pending_confirmations": sales_today['pending_confirmations'],
+                "total_amount": float(sales_today['confirmed_amount']) + float(sales_today['pending_amount'])
             },
-            "today_summary": {
-                "date": datetime.now().date().isoformat(),
-                "sales": {
-                    "total_count": sales_today['total_sales'],
-                    "confirmed_amount": float(sales_today['confirmed_amount']),
-                    "pending_amount": float(sales_today['pending_amount']),
-                    "pending_confirmations": sales_today['pending_confirmations'],
-                    "total_amount": float(sales_today['confirmed_amount']) + float(sales_today['pending_amount'])
-                },
-                "payment_methods_breakdown": payment_methods,
-                "expenses": {
-                    "count": expenses_today['count'],
-                    "total_amount": float(expenses_today['total'])
-                },
-                "net_income": float(sales_today['confirmed_amount']) - float(expenses_today['total'])
+            "payment_methods_breakdown": payment_methods,
+            "expenses": {
+                "count": expenses_today['count'],
+                "total_amount": float(expenses_today['total'])
             },
-            "pending_actions": {
-                "sale_confirmations": sales_today['pending_confirmations'],
-                "transfer_requests": {
-                    "pending": transfer_stats['pending'],
-                    "in_transit": transfer_stats['in_transit'],
-                    "delivered": transfer_stats['delivered']
-                },
-                "discount_requests": {
-                    "pending": discount_stats['pending'],
-                    "approved": discount_stats['approved'],
-                    "rejected": discount_stats['rejected']
-                },
-                "return_notifications": unread_returns
+            "net_income": float(sales_today['confirmed_amount']) - float(expenses_today['total'])
+        },
+        "pending_actions": {
+            "sale_confirmations": sales_today['pending_confirmations'],
+            "transfer_requests": {
+                "pending": transfer_stats['pending'],
+                "in_transit": transfer_stats['in_transit'],
+                "delivered": transfer_stats['delivered']
             },
-            "quick_actions": [
-                "Escanear nuevo tenis",
-                "Registrar venta",
-                "Registrar gasto",
-                "Solicitar transferencia",
-                "Ver ventas del día"
-            ]
-        }
-    finally:
-        conn.close()
+            "discount_requests": {
+                "pending": discount_stats['pending'],
+                "approved": discount_stats['approved'],
+                "rejected": discount_stats['rejected']
+            },
+            "return_notifications": unread_returns
+        },
+        "quick_actions": [
+            "Escanear nuevo tenis",
+            "Registrar venta",
+            "Registrar gasto",
+            "Solicitar transferencia",
+            "Ver ventas del día"
+        ]
+    }
 
 # UBICACIONES
 @app.get("/api/v1/locations")
 async def get_locations(current_user = Depends(get_current_user)):
     """Obtener todas las ubicaciones disponibles para transferencias"""
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute(
+            '''SELECT *, 
+               CASE 
+                 WHEN id = %s THEN 1 
+                 ELSE 0 
+               END as is_current_location
+               FROM locations 
+               WHERE is_active = TRUE
+               ORDER BY is_current_location DESC, name''',
+            (current_user['location_id'],)
+        )
+        locations = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute(
+            '''SELECT *, 
+               CASE 
+                 WHEN id = ? THEN 1 
+                 ELSE 0 
+               END as is_current_location
+               FROM locations 
+               WHERE is_active = 1
+               ORDER BY is_current_location DESC, name''',
+            (current_user['location_id'],)
+        )
+        locations = [dict(row) for row in cursor.fetchall()]
     
-    cursor = conn.execute(
-        '''SELECT *, 
-           CASE 
-             WHEN id = ? THEN 1 
-             ELSE 0 
-           END as is_current_location
-           FROM locations 
-           WHERE is_active = TRUE
-           ORDER BY is_current_location DESC, name''',
-        (current_user['location_id'],)
-    )
-    locations = [dict(row) for row in cursor.fetchall()]
     conn.close()
     
     return {
@@ -692,41 +793,77 @@ async def create_sale_complete(
             detail=f"Los métodos de pago (${total_payments:.2f}) no coinciden con el total (${sale_data.total_amount:.2f})"
         )
     
-    conn = sqlite3.connect(DB_PATH)
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+    else:
+        conn = sqlite3.connect(DB_PATH)
     
     try:
         # Crear la venta con hora de venta y confirmación
         sale_timestamp = datetime.now().isoformat()
-        cursor = conn.execute(
-            '''INSERT INTO sales (seller_id, location_id, total_amount, receipt_image, notes, 
-                                requires_confirmation, confirmed, confirmed_at, sale_date)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (current_user['id'], current_user['location_id'], sale_data.total_amount, 
-             sale_data.receipt_image, sale_data.notes, sale_data.requires_confirmation,
-             not sale_data.requires_confirmation,  # Si no requiere confirmación, ya está confirmada
-             None if sale_data.requires_confirmation else sale_timestamp,
-             sale_timestamp)
-        )
-        sale_id = cursor.lastrowid
+        
+        if USE_POSTGRESQL:
+            cursor.execute(
+                '''INSERT INTO sales (seller_id, location_id, total_amount, receipt_image, notes, 
+                                    requires_confirmation, confirmed, confirmed_at, sale_date)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                (current_user['id'], current_user['location_id'], sale_data.total_amount, 
+                 sale_data.receipt_image, sale_data.notes, sale_data.requires_confirmation,
+                 not sale_data.requires_confirmation,  # Si no requiere confirmación, ya está confirmada
+                 None if sale_data.requires_confirmation else sale_timestamp,
+                 sale_timestamp)
+            )
+            sale_id = cursor.fetchone()[0]
+        else:
+            cursor = conn.execute(
+                '''INSERT INTO sales (seller_id, location_id, total_amount, receipt_image, notes, 
+                                    requires_confirmation, confirmed, confirmed_at, sale_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (current_user['id'], current_user['location_id'], sale_data.total_amount, 
+                 sale_data.receipt_image, sale_data.notes, sale_data.requires_confirmation,
+                 not sale_data.requires_confirmation,
+                 None if sale_data.requires_confirmation else sale_timestamp,
+                 sale_timestamp)
+            )
+            sale_id = cursor.lastrowid
         
         # Crear los métodos de pago
         for payment in sale_data.payment_methods:
-            conn.execute(
-                '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
-                   VALUES (?, ?, ?, ?)''',
-                (sale_id, payment.type, payment.amount, payment.reference)
-            )
+            if USE_POSTGRESQL:
+                cursor.execute(
+                    '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
+                       VALUES (%s, %s, %s, %s)''',
+                    (sale_id, payment.type, payment.amount, payment.reference)
+                )
+            else:
+                conn.execute(
+                    '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
+                       VALUES (?, ?, ?, ?)''',
+                    (sale_id, payment.type, payment.amount, payment.reference)
+                )
         
         # Crear los items de la venta
         for item in sale_data.items:
             subtotal = item['quantity'] * item['unit_price']
-            conn.execute(
-                '''INSERT INTO sale_items (sale_id, sneaker_reference_code, brand, model, color, 
-                                         size, quantity, unit_price, subtotal)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (sale_id, item['sneaker_reference_code'], item['brand'], item['model'], 
-                 item.get('color'), item['size'], item['quantity'], item['unit_price'], subtotal)
-            )
+            if USE_POSTGRESQL:
+                cursor.execute(
+                    '''INSERT INTO sale_items (sale_id, sneaker_reference_code, brand, model, color, 
+                                             size, quantity, unit_price, subtotal)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                    (sale_id, item['sneaker_reference_code'], item['brand'], item['model'], 
+                     item.get('color'), item['size'], item['quantity'], item['unit_price'], subtotal)
+                )
+            else:
+                conn.execute(
+                    '''INSERT INTO sale_items (sale_id, sneaker_reference_code, brand, model, color, 
+                                             size, quantity, unit_price, subtotal)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (sale_id, item['sneaker_reference_code'], item['brand'], item['model'], 
+                     item.get('color'), item['size'], item['quantity'], item['unit_price'], subtotal)
+                )
         
         conn.commit()
         
@@ -763,14 +900,25 @@ async def confirm_sale(
     if current_user['role'] not in ['vendedor', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden confirmar ventas")
     
-    conn = sqlite3.connect(DB_PATH)
-    
-    # Verificar que la venta existe y pertenece al vendedor
-    cursor = conn.execute(
-        'SELECT * FROM sales WHERE id = ? AND seller_id = ? AND requires_confirmation = 1',
-        (confirmation.sale_id, current_user['id'])
-    )
-    sale = cursor.fetchone()
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Verificar que la venta existe y pertenece al vendedor
+        cursor.execute(
+            'SELECT * FROM sales WHERE id = %s AND seller_id = %s AND requires_confirmation = TRUE',
+            (confirmation.sale_id, current_user['id'])
+        )
+        sale = cursor.fetchone()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.execute(
+            'SELECT * FROM sales WHERE id = ? AND seller_id = ? AND requires_confirmation = 1',
+            (confirmation.sale_id, current_user['id'])
+        )
+        sale = cursor.fetchone()
     
     if not sale:
         conn.close()
@@ -778,15 +926,27 @@ async def confirm_sale(
     
     # Actualizar confirmación de la venta
     confirmation_timestamp = datetime.now().isoformat()
-    conn.execute(
-        '''UPDATE sales 
-           SET confirmed = ?, confirmed_at = ?, notes = COALESCE(notes, '') || ? 
-           WHERE id = ?''',
-        (confirmation.confirmed, 
-         confirmation_timestamp if confirmation.confirmed else None,
-         f"\nConfirmación ({confirmation_timestamp}): {confirmation.confirmation_notes}" if confirmation.confirmation_notes else "",
-         confirmation.sale_id)
-    )
+    
+    if USE_POSTGRESQL:
+        cursor.execute(
+            '''UPDATE sales 
+               SET confirmed = %s, confirmed_at = %s, notes = COALESCE(notes, '') || %s 
+               WHERE id = %s''',
+            (confirmation.confirmed, 
+             confirmation_timestamp if confirmation.confirmed else None,
+             f"\nConfirmación ({confirmation_timestamp}): {confirmation.confirmation_notes}" if confirmation.confirmation_notes else "",
+             confirmation.sale_id)
+        )
+    else:
+        conn.execute(
+            '''UPDATE sales 
+               SET confirmed = ?, confirmed_at = ?, notes = COALESCE(notes, '') || ? 
+               WHERE id = ?''',
+            (confirmation.confirmed, 
+             confirmation_timestamp if confirmation.confirmed else None,
+             f"\nConfirmación ({confirmation_timestamp}): {confirmation.confirmation_notes}" if confirmation.confirmation_notes else "",
+             confirmation.sale_id)
+        )
     
     conn.commit()
     conn.close()
@@ -807,10 +967,45 @@ async def get_today_sales(current_user = Depends(get_current_user)):
     if current_user['role'] not in ['vendedor', 'administrador']:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    
-    try:
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Obtener todas las ventas del día
+        cursor.execute(
+            '''SELECT s.*, u.first_name, u.last_name, l.name as location_name
+               FROM sales s
+               JOIN users u ON s.seller_id = u.id
+               JOIN locations l ON s.location_id = l.id
+               WHERE DATE(s.sale_date) = CURRENT_DATE
+               AND s.seller_id = %s
+               ORDER BY s.sale_date DESC''',
+            (current_user['id'],)
+        )
+        sales = [dict(row) for row in cursor.fetchall()]
+        
+        # Para cada venta, obtener items y métodos de pago
+        for sale in sales:
+            # Items de la venta
+            cursor.execute(
+                'SELECT * FROM sale_items WHERE sale_id = %s',
+                (sale['id'],)
+            )
+            sale['items'] = [dict(row) for row in cursor.fetchall()]
+            
+            # Métodos de pago
+            cursor.execute(
+                'SELECT * FROM sale_payments WHERE sale_id = %s',
+                (sale['id'],)
+            )
+            sale['payment_methods'] = [dict(row) for row in cursor.fetchall()]
+            
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
         # Obtener todas las ventas del día
         cursor = conn.execute(
             '''SELECT s.*, u.first_name, u.last_name, l.name as location_name
@@ -839,47 +1034,48 @@ async def get_today_sales(current_user = Depends(get_current_user)):
                 (sale['id'],)
             )
             sale['payment_methods'] = [dict(row) for row in cursor.fetchall()]
-            
-            # Agregar información de estado
-            sale['status_info'] = {
-                "is_confirmed": bool(sale['confirmed']),
-                "requires_confirmation": bool(sale['requires_confirmation']),
-                "has_receipt": bool(sale['receipt_image']),
-                "confirmation_pending": bool(sale['requires_confirmation'] and not sale['confirmed'])
-            }
-        
-        # Calcular estadísticas del día
-        total_amount = sum(sale['total_amount'] for sale in sales if sale['confirmed'])
-        total_items = sum(len(sale['items']) for sale in sales)
-        pending_amount = sum(sale['total_amount'] for sale in sales if sale['requires_confirmation'] and not sale['confirmed'])
-        
-        # Estadísticas por método de pago
-        payment_stats = {}
-        for sale in sales:
-            if sale['confirmed']:
-                for payment in sale['payment_methods']:
-                    if payment['payment_type'] not in payment_stats:
-                        payment_stats[payment['payment_type']] = {"count": 0, "amount": 0}
-                    payment_stats[payment['payment_type']]["count"] += 1
-                    payment_stats[payment['payment_type']]["amount"] += payment['amount']
-        
-        return {
-            "success": True,
-            "date": datetime.now().date().isoformat(),
-            "sales": sales,
-            "summary": {
-                "total_sales": len(sales),
-                "confirmed_sales": len([s for s in sales if s['confirmed']]),
-                "pending_confirmation": len([s for s in sales if s['requires_confirmation'] and not s['confirmed']]),
-                "total_amount": float(total_amount),
-                "pending_amount": float(pending_amount),
-                "total_items": total_items,
-                "average_sale": round(float(total_amount) / len([s for s in sales if s['confirmed']]), 2) if [s for s in sales if s['confirmed']] else 0,
-                "payment_methods_stats": payment_stats
-            }
+    
+    # Agregar información de estado para todas las ventas
+    for sale in sales:
+        sale['status_info'] = {
+            "is_confirmed": bool(sale['confirmed']),
+            "requires_confirmation": bool(sale['requires_confirmation']),
+            "has_receipt": bool(sale['receipt_image']),
+            "confirmation_pending": bool(sale['requires_confirmation'] and not sale['confirmed'])
         }
-    finally:
-        conn.close()
+    
+    # Calcular estadísticas del día
+    total_amount = sum(sale['total_amount'] for sale in sales if sale['confirmed'])
+    total_items = sum(len(sale['items']) for sale in sales)
+    pending_amount = sum(sale['total_amount'] for sale in sales if sale['requires_confirmation'] and not sale['confirmed'])
+    
+    # Estadísticas por método de pago
+    payment_stats = {}
+    for sale in sales:
+        if sale['confirmed']:
+            for payment in sale['payment_methods']:
+                if payment['payment_type'] not in payment_stats:
+                    payment_stats[payment['payment_type']] = {"count": 0, "amount": 0}
+                payment_stats[payment['payment_type']]["count"] += 1
+                payment_stats[payment['payment_type']]["amount"] += payment['amount']
+    
+    conn.close()
+    
+    return {
+        "success": True,
+        "date": datetime.now().date().isoformat(),
+        "sales": sales,
+        "summary": {
+            "total_sales": len(sales),
+            "confirmed_sales": len([s for s in sales if s['confirmed']]),
+            "pending_confirmation": len([s for s in sales if s['requires_confirmation'] and not s['confirmed']]),
+            "total_amount": float(total_amount),
+            "pending_amount": float(pending_amount),
+            "total_items": total_items,
+            "average_sale": round(float(total_amount) / len([s for s in sales if s['confirmed']]), 2) if [s for s in sales if s['confirmed']] else 0,
+            "payment_methods_stats": payment_stats
+        }
+    }
 
 @app.get("/api/v1/sales/pending-confirmation")
 async def get_pending_confirmation_sales(current_user = Depends(get_current_user)):
@@ -887,10 +1083,34 @@ async def get_pending_confirmation_sales(current_user = Depends(get_current_user
     if current_user['role'] not in ['vendedor', 'administrador']:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    
-    try:
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute(
+            '''SELECT s.*, u.first_name, u.last_name, l.name as location_name
+                FROM sales s
+                JOIN users u ON s.seller_id = u.id
+                JOIN locations l ON s.location_id = l.id
+                WHERE s.seller_id = %s AND s.requires_confirmation = TRUE AND s.confirmed = FALSE
+                ORDER BY s.sale_date DESC''',
+            (current_user['id'],)
+        )
+        sales = [dict(row) for row in cursor.fetchall()]
+        
+        # Para cada venta, obtener items y métodos de pago
+        for sale in sales:
+            cursor.execute('SELECT * FROM sale_items WHERE sale_id = %s', (sale['id'],))
+            sale['items'] = [dict(row) for row in cursor.fetchall()]
+            
+            cursor.execute('SELECT * FROM sale_payments WHERE sale_id = %s', (sale['id'],))
+            sale['payment_methods'] = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
         cursor = conn.execute(
             '''SELECT s.*, u.first_name, u.last_name, l.name as location_name
                 FROM sales s
@@ -909,37 +1129,53 @@ async def get_pending_confirmation_sales(current_user = Depends(get_current_user
             
             cursor = conn.execute('SELECT * FROM sale_payments WHERE sale_id = ?', (sale['id'],))
             sale['payment_methods'] = [dict(row) for row in cursor.fetchall()]
-        
-        return {
-            "success": True,
-            "pending_sales": sales,
-            "count": len(sales),
-            "total_pending_amount": sum(sale['total_amount'] for sale in sales)
-        }
-    finally:
-        conn.close()
+    
+    conn.close()
+    
+    return {
+        "success": True,
+        "pending_sales": sales,
+        "count": len(sales),
+        "total_pending_amount": sum(sale['total_amount'] for sale in sales)
+    }
 
 # GASTOS
 @app.post("/api/v1/expenses/create")
 async def create_expense(
-expense_data: ExpenseCreate,
-current_user = Depends(get_current_user)
+    expense_data: ExpenseCreate,
+    current_user = Depends(get_current_user)
 ):
     """Registrar gasto (concepto del gasto, valor, comprobante) según requerimientos"""
     
     if current_user['role'] not in ['vendedor', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden registrar gastos")
     
-    conn = sqlite3.connect(DB_PATH)
+    if USE_POSTGRESQL:
+        import psycopg2
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+    else:
+        conn = sqlite3.connect(DB_PATH)
     
     expense_timestamp = datetime.now().isoformat()
-    cursor = conn.execute(
-        '''INSERT INTO expenses (user_id, location_id, concept, amount, receipt_image, notes, expense_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?)''',
-        (current_user['id'], current_user['location_id'], expense_data.concept, 
-            expense_data.amount, expense_data.receipt_image, expense_data.notes, expense_timestamp)
-    )
-    expense_id = cursor.lastrowid
+    
+    if USE_POSTGRESQL:
+        cursor.execute(
+            '''INSERT INTO expenses (user_id, location_id, concept, amount, receipt_image, notes, expense_date)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+            (current_user['id'], current_user['location_id'], expense_data.concept, 
+             expense_data.amount, expense_data.receipt_image, expense_data.notes, expense_timestamp)
+        )
+        expense_id = cursor.fetchone()[0]
+    else:
+        cursor = conn.execute(
+            '''INSERT INTO expenses (user_id, location_id, concept, amount, receipt_image, notes, expense_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (current_user['id'], current_user['location_id'], expense_data.concept, 
+             expense_data.amount, expense_data.receipt_image, expense_data.notes, expense_timestamp)
+        )
+        expense_id = cursor.lastrowid
+    
     conn.commit()
     conn.close()
     print(f"✅ Gasto registrado: {expense_data.concept} ({expense_data.amount})")
@@ -965,20 +1201,39 @@ async def get_today_expenses(current_user = Depends(get_current_user)):
     if current_user['role'] not in ['vendedor', 'administrador']:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute(
+            '''SELECT e.*, u.first_name, u.last_name, l.name as location_name
+               FROM expenses e
+               JOIN users u ON e.user_id = u.id
+               JOIN locations l ON e.location_id = l.id
+               WHERE DATE(e.expense_date) = CURRENT_DATE 
+               AND e.user_id = %s
+               ORDER BY e.expense_date DESC''',
+            (current_user['id'],)
+        )
+        expenses = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute(
+            '''SELECT e.*, u.first_name, u.last_name, l.name as location_name
+               FROM expenses e
+               JOIN users u ON e.user_id = u.id
+               JOIN locations l ON e.location_id = l.id
+               WHERE DATE(e.expense_date) = DATE('now', 'localtime') 
+               AND e.user_id = ?
+               ORDER BY e.expense_date DESC''',
+            (current_user['id'],)
+        )
+        expenses = [dict(row) for row in cursor.fetchall()]
     
-    cursor = conn.execute(
-        '''SELECT e.*, u.first_name, u.last_name, l.name as location_name
-            FROM expenses e
-            JOIN users u ON e.user_id = u.id
-            JOIN locations l ON e.location_id = l.id
-            WHERE DATE(e.expense_date) = DATE('now', 'localtime') 
-            AND e.user_id = ?
-            ORDER BY e.expense_date DESC''',
-        (current_user['id'],)
-    )
-    expenses = [dict(row) for row in cursor.fetchall()]
     conn.close()
     
     # Categorizar gastos por concepto
@@ -1003,7 +1258,6 @@ async def get_today_expenses(current_user = Depends(get_current_user)):
             "average_expense": round(float(total_amount) / len(expenses), 2) if expenses else 0
         }
     }
-
 # SOLICITUDES DE TRANSFERENCIA COMPLETAS
 @app.post("/api/v1/transfers/request")
 async def create_transfer_request_complete(
