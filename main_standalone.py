@@ -146,7 +146,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         conn = psycopg2.connect(DB_PATH)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cursor.execute(
-            "SELECT * FROM users WHERE id = %s AND is_active = 1", (user_id,)
+            "SELECT * FROM users WHERE id = %s AND is_active = TRUE", (user_id,)
         )
         user = cursor.fetchone()
         conn.close()
@@ -269,7 +269,7 @@ async def login(credentials: UserLogin):
             '''SELECT u.*, l.name as location_name 
                FROM users u 
                LEFT JOIN locations l ON u.location_id = l.id
-               WHERE u.email = %s AND u.is_active = 1''',
+               WHERE u.email = %s AND u.is_active = TRUE''',  # ✅ TRUE en lugar de 1
             (credentials.email,)
         )
         user = cursor.fetchone()
@@ -283,7 +283,7 @@ async def login(credentials: UserLogin):
             '''SELECT u.*, l.name as location_name 
                FROM users u 
                LEFT JOIN locations l ON u.location_id = l.id
-               WHERE u.email = ? AND u.is_active = 1''',
+               WHERE u.email = ? AND u.is_active = 1''',  # ✅ 1 para SQLite
             (credentials.email,)
         )
         user = cursor.fetchone()
@@ -659,7 +659,7 @@ async def get_locations(current_user = Depends(get_current_user)):
              ELSE 0 
            END as is_current_location
            FROM locations 
-           WHERE is_active = 1 
+           WHERE is_active = TRUE
            ORDER BY is_current_location DESC, name''',
         (current_user['location_id'],)
     )
@@ -1665,34 +1665,85 @@ def create_postgresql_tables(conn):
         )
     ''')
     
-    # Insertar ubicación por defecto
-    cursor.execute(
-        'INSERT INTO locations (name, type, address) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
-        ("Local Principal", "local", "Dirección principal")
-    )
+    # Insertar ubicaciones por defecto
+    locations_to_create = [
+        ("Local Principal", "local", "Calle Principal 123"),
+        ("Local Norte", "local", "Av. Norte 456"),
+        ("Local Sur", "local", "Calle Sur 789"),
+        ("Bodega Central", "bodega", "Zona Industrial 101"),
+        ("Bodega Norte", "bodega", "Zona Industrial Norte 202")
+    ]
+    
+    for location_data in locations_to_create:
+        cursor.execute(
+            'INSERT INTO locations (name, type, address) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
+            location_data
+        )
+        print(f"✅ Ubicación creada: {location_data[0]} ({location_data[1]})")
     
     # Crear usuario admin por defecto
+    # Crear usuarios por defecto de diferentes roles
     try:
         from passlib.context import CryptContext
         pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-        admin_password = pwd_ctx.hash("admin123")
         
         cursor.execute("SELECT id FROM locations WHERE name = %s", ("Local Principal",))
         location_result = cursor.fetchone()
         if location_result:
             location_id = location_result[0]
             
-            cursor.execute(
-                '''INSERT INTO users (email, password_hash, first_name, last_name, role, location_id)
-                   VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (email) DO NOTHING''',
-                ("admin@tustockya.com", admin_password, "Admin", "TuStockYa", "administrador", location_id)
-            )
-            print("✅ Usuario admin creado: admin@tustockya.com / admin123")
+            # Lista de usuarios a crear
+            users_to_create = [
+                {
+                    "email": "admin@tustockya.com",
+                    "password": "admin123",
+                    "first_name": "Admin",
+                    "last_name": "TuStockYa",
+                    "role": "administrador"
+                },
+                {
+                    "email": "vendedor@tustockya.com",
+                    "password": "vendedor123",
+                    "first_name": "Juan",
+                    "last_name": "Vendedor",
+                    "role": "vendedor"
+                },
+                {
+                    "email": "vendedor2@tustockya.com",
+                    "password": "vendedor123",
+                    "first_name": "María",
+                    "last_name": "González",
+                    "role": "vendedor"
+                },
+                {
+                    "email": "bodeguero@tustockya.com",
+                    "password": "bodeguero123",
+                    "first_name": "Carlos",
+                    "last_name": "Bodeguero",
+                    "role": "bodeguero"
+                },
+                {
+                    "email": "corredor@tustockya.com",
+                    "password": "corredor123",
+                    "first_name": "Luis",
+                    "last_name": "Corredor",
+                    "role": "corredor"
+                }
+            ]
+            
+            for user_data in users_to_create:
+                password_hash = pwd_ctx.hash(user_data["password"])
+                
+                cursor.execute(
+                    '''INSERT INTO users (email, password_hash, first_name, last_name, role, location_id)
+                       VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (email) DO NOTHING''',
+                    (user_data["email"], password_hash, user_data["first_name"], 
+                     user_data["last_name"], user_data["role"], location_id)
+                )
+                print(f"✅ Usuario {user_data['role']}: {user_data['email']} / {user_data['password']}")
+                
     except Exception as e:
-        print(f"⚠️ Error creando usuario admin: {e}")
-    
-    conn.commit()
-    print("✅ Tablas PostgreSQL creadas exitosamente")
+        print(f"⚠️ Error creando usuarios: {e}")
 
 # ==================== EJECUTAR APLICACIÓN ====================
 
