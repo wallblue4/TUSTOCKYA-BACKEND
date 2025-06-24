@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: tustockya-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main_standalone.py
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PORT
+        value: 10000
+
+databases:
+  - name: tustockya-db
+    databaseName: tustockya
+    user: tustockya
+    plan: free

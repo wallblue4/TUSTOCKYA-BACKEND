@@ -5,7 +5,6 @@ python-multipart==0.0.6
 
 # Base de datos
 psycopg2-binary==2.9.9
-redis==5.0.1
 
 # Autenticación
 python-jose[cryptography]==3.3.0
@@ -16,7 +15,7 @@ pydantic>=2.8.0
 python-dateutil==2.8.2
 aiofiles==23.2.1
 
-# Machine Learning (CPU optimizado para Railway)
+# Machine Learning (CPU optimizado y ligero)
 torch==2.1.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
 torchvision==0.16.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
 ftfy==6.1.1
@@ -26,7 +25,10 @@ tqdm==4.66.1
 # CLIP
 git+https://github.com/openai/CLIP.git
 
-# Procesamiento de imágenes (sin GUI para Railway)
+# Procesamiento de imágenes (sin GUI)
 opencv-python-headless==4.8.1.78
 Pillow==10.1.0
 numpy==1.24.4
+
+# Para Render
+gunicorn==21.2.0
