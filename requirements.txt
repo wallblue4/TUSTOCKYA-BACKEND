@@ -15,9 +15,9 @@ pydantic>=2.8.0
 python-dateutil==2.8.2
 aiofiles==23.2.1
 
-# Machine Learning (CPU optimizado y ligero)
-torch==2.1.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
-torchvision==0.16.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
+# Machine Learning (versiones estándar sin +cpu)
+torch==2.1.0
+torchvision==0.16.0
 ftfy==6.1.1
 regex==2023.10.3
 tqdm==4.66.1
@@ -25,10 +25,10 @@ tqdm==4.66.1
 # CLIP
 git+https://github.com/openai/CLIP.git
 
-# Procesamiento de imágenes (sin GUI)
+# Procesamiento de imágenes
 opencv-python-headless==4.8.1.78
 Pillow==10.1.0
 numpy==1.24.4
 
-# Para Render
+# Para web server
 gunicorn==21.2.0
