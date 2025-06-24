@@ -1,0 +1,28 @@
+# docker-compose.yml - Puerto libre
+version: '3.8'
+
+services:
+  # PostgreSQL
+  postgres:
+    image: postgres:15
+    container_name: tustockya-postgres
+    environment:
+      POSTGRES_USER: tustockya
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: tustockya_db
+    ports:
+      - "5433:5432"  # Puerto 5433 en host para evitar conflictos
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: tustockya-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

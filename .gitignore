@@ -1,0 +1,36 @@
+# Base de datos local
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Uploads (pero mantener directorio)
+data/uploads/*
+!data/uploads/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backups
+*_backup.py
