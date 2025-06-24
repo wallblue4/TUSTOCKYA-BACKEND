@@ -23,17 +23,23 @@ SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-cambia-en-produccion")
 PORT = int(os.getenv("PORT", "10000"))  # Render usa puerto 10000 por defecto
 
 
-if os.getenv("RENDER"):  # Render pone esta variable automáticamente
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://default")
-
 # Configuración de base de datos
-if DATABASE_URL.startswith("sqlite"):
+# Detectar si estamos en Render (siempre usar PostgreSQL)
+if os.getenv("RENDER") or os.getenv("DATABASE_URL", "").startswith("postgresql"):
+    # Estamos en Render - usar PostgreSQL
+    DB_PATH = DATABASE_URL
+    USE_POSTGRESQL = True
+    print(f"💾 Usando PostgreSQL: {DATABASE_URL[:50]}...")
+elif DATABASE_URL.startswith("sqlite"):
+    # Desarrollo local - usar SQLite
     DB_PATH = DATABASE_URL.replace("sqlite:///", "")
     os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else "data", exist_ok=True)
+    USE_POSTGRESQL = False
     print(f"💾 Usando SQLite: {DB_PATH}")
 else:
-    # Para PostgreSQL en Railway
+    # Fallback a PostgreSQL
     DB_PATH = DATABASE_URL
+    USE_POSTGRESQL = True
     print(f"💾 Usando PostgreSQL: {DATABASE_URL[:50]}...")
 
 # Crear directorio de uploads
@@ -132,14 +138,27 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     if not user_id:
         raise HTTPException(status_code=401, detail="Token inválido")
     
-    # Buscar usuario en BD
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.execute(
-        "SELECT * FROM users WHERE id = ? AND is_active = 1", (user_id,)
-    )
-    user = cursor.fetchone()
-    conn.close()
+    if USE_POSTGRESQL:
+        # Usar PostgreSQL
+        import psycopg2
+        import psycopg2.extras
+        
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cursor.execute(
+            "SELECT * FROM users WHERE id = %s AND is_active = 1", (user_id,)
+        )
+        user = cursor.fetchone()
+        conn.close()
+    else:
+        # Usar SQLite
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT * FROM users WHERE id = ? AND is_active = 1", (user_id,)
+        )
+        user = cursor.fetchone()
+        conn.close()
     
     if not user:
         raise HTTPException(status_code=401, detail="Usuario no encontrado")
@@ -237,18 +256,38 @@ async def health():
 @app.post("/api/v1/auth/login")
 async def login(credentials: UserLogin):
     """Login de usuario"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
     
-    cursor = conn.execute(
-        '''SELECT u.*, l.name as location_name 
-           FROM users u 
-           LEFT JOIN locations l ON u.location_id = l.id
-           WHERE u.email = ? AND u.is_active = 1''',
-        (credentials.email,)
-    )
-    user = cursor.fetchone()
-    conn.close()
+    if USE_POSTGRESQL:
+        # Usar PostgreSQL
+        import psycopg2
+        import psycopg2.extras
+        
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute(
+            '''SELECT u.*, l.name as location_name 
+               FROM users u 
+               LEFT JOIN locations l ON u.location_id = l.id
+               WHERE u.email = %s AND u.is_active = 1''',
+            (credentials.email,)
+        )
+        user = cursor.fetchone()
+        conn.close()
+    else:
+        # Usar SQLite
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute(
+            '''SELECT u.*, l.name as location_name 
+               FROM users u 
+               LEFT JOIN locations l ON u.location_id = l.id
+               WHERE u.email = ? AND u.is_active = 1''',
+            (credentials.email,)
+        )
+        user = cursor.fetchone()
+        conn.close()
     
     if not user or not verify_password(credentials.password, user['password_hash']):
         raise HTTPException(status_code=401, detail="Email o contraseña incorrectos")
