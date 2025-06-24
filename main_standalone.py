@@ -1258,6 +1258,7 @@ async def get_today_expenses(current_user = Depends(get_current_user)):
             "average_expense": round(float(total_amount) / len(expenses), 2) if expenses else 0
         }
     }
+    
 # SOLICITUDES DE TRANSFERENCIA COMPLETAS
 @app.post("/api/v1/transfers/request")
 async def create_transfer_request_complete(
