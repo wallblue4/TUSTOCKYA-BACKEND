@@ -20,7 +20,7 @@ import jwt
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/tustockya.db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-cambia-en-produccion")
-PORT = int(os.getenv("PORT", "8001"))
+PORT = int(os.getenv("PORT", "10000"))  # Render usa puerto 10000 por defecto
 
 # Configuración de base de datos
 if DATABASE_URL.startswith("sqlite"):
