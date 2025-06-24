@@ -22,6 +22,10 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-cambia-en-produccion")
 PORT = int(os.getenv("PORT", "10000"))  # Render usa puerto 10000 por defecto
 
+
+if os.getenv("RENDER"):  # Render pone esta variable automáticamente
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://default")
+
 # Configuración de base de datos
 if DATABASE_URL.startswith("sqlite"):
     DB_PATH = DATABASE_URL.replace("sqlite:///", "")
