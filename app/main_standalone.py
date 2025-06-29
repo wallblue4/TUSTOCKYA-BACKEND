@@ -1,4 +1,4 @@
-# main_standalone.py - Versión completa con todos los requerimientos del vendedor
+# main_standalone.py - Versión completa con todos los requerimientos del seller
 import sys
 import os
 import sqlite3
@@ -52,7 +52,7 @@ class PaymentMethod(BaseModel):
     amount: float
     reference: str = None  # Número de tarjeta (últimos 4), referencia transferencia, etc.
 
-# Schemas para módulo vendedor completo
+# Schemas para módulo seller completo
 class SaleCreateComplete(BaseModel):
     items: list
     total_amount: float
@@ -80,7 +80,7 @@ class TransferRequestComplete(BaseModel):
     size: str
     quantity: int
     purpose: str  # 'exhibition' o 'sale'
-    pickup_type: str  # 'vendedor' o 'corredor'
+    pickup_type: str  # 'seller' o 'corredor'
     destination_type: str  # 'bodega' o 'exhibicion' - donde se guardará
     notes: str = None
 
@@ -148,7 +148,7 @@ app = FastAPI(
     title="TuStockYa Backend - Railway Ready",
     version="1.0.0",
     docs_url="/docs",
-    description="Sistema completo para gestión de inventario de tenis con módulo vendedor completo - Railway Compatible"
+    description="Sistema completo para gestión de inventario de tenis con módulo seller completo - Railway Compatible"
 )
 
 # CORS mejorado para Railway
@@ -186,7 +186,7 @@ async def root():
             "Solicitudes de transferencia con ubicación específica",
             "Solicitudes de descuento",
             "Notificaciones de devolución",
-            "Dashboard completo del vendedor"
+            "Dashboard completo del seller"
         ]
     }
 
@@ -222,7 +222,7 @@ async def health():
         "modules": [
             "Autenticación",
             "Clasificación con CLIP",
-            "Módulo Vendedor Completo",
+            "Módulo seller Completo",
             "Gestión de Inventario",
             "Transferencias y Devoluciones"
         ]
@@ -471,14 +471,14 @@ async def classification_health():
         ]
     }
 
-# ==================== MÓDULO VENDEDOR COMPLETO ====================
+# ==================== MÓDULO seller COMPLETO ====================
 
-# DASHBOARD COMPLETO DEL VENDEDOR
+# DASHBOARD COMPLETO DEL seller
 @app.get("/api/v1/vendor/dashboard")
 async def get_vendor_dashboard_complete(current_user = Depends(get_current_user)):
-    """Dashboard completo del vendedor con todas las funcionalidades según requerimientos"""
+    """Dashboard completo del seller con todas las funcionalidades según requerimientos"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
+    if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     
     conn = sqlite3.connect(DB_PATH)
@@ -638,8 +638,8 @@ async def create_sale_complete(
 ):
     """Registrar una nueva venta completa con métodos de pago según requerimientos"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo vendedores pueden registrar ventas")
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo selleres pueden registrar ventas")
     
     # Validar que los métodos de pago sumen el total
     total_payments = sum(payment.amount for payment in sale_data.payment_methods)
@@ -717,12 +717,12 @@ async def confirm_sale(
 ):
     """Confirmar una venta pendiente - Confirmación de la venta según requerimientos"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo vendedores pueden confirmar ventas")
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo selleres pueden confirmar ventas")
     
     conn = sqlite3.connect(DB_PATH)
     
-    # Verificar que la venta existe y pertenece al vendedor
+    # Verificar que la venta existe y pertenece al seller
     cursor = conn.execute(
         'SELECT * FROM sales WHERE id = ? AND seller_id = ? AND requires_confirmation = 1',
         (confirmation.sale_id, current_user['id'])
@@ -761,7 +761,7 @@ async def confirm_sale(
 async def get_today_sales(current_user = Depends(get_current_user)):
     """Visualizar todas las ventas del día según requerimientos"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
+    if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     
     conn = sqlite3.connect(DB_PATH)
@@ -841,7 +841,7 @@ async def get_today_sales(current_user = Depends(get_current_user)):
 @app.get("/api/v1/sales/pending-confirmation")
 async def get_pending_confirmation_sales(current_user = Depends(get_current_user)):
     """Obtener ventas pendientes de confirmación"""
-    if current_user['role'] not in ['vendedor', 'administrador']:
+    if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     
     conn = sqlite3.connect(DB_PATH)
@@ -884,8 +884,8 @@ current_user = Depends(get_current_user)
 ):
     """Registrar gasto (concepto del gasto, valor, comprobante) según requerimientos"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo vendedores pueden registrar gastos")
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo selleres pueden registrar gastos")
     
     conn = sqlite3.connect(DB_PATH)
     
@@ -919,7 +919,7 @@ current_user = Depends(get_current_user)
 async def get_today_expenses(current_user = Depends(get_current_user)):
     """Obtener gastos del día actual"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
+    if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Acceso denegado")
     
     conn = sqlite3.connect(DB_PATH)
@@ -969,8 +969,8 @@ current_user = Depends(get_current_user)
 ):
     """Solicitar tenis de otro local según requerimientos (siguiendo el flujo del escaneo)"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo vendedores pueden solicitar transferencias")
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo selleres pueden solicitar transferencias")
     
     conn = sqlite3.connect(DB_PATH)
     
@@ -1012,14 +1012,14 @@ current_user = Depends(get_current_user)
             "purpose": "Para exhibición" if transfer_data.purpose == "exhibition" else "Para venta",
             "pickup_arrangement": {
                 "type": transfer_data.pickup_type,
-                "description": "El mismo vendedor recogerá" if transfer_data.pickup_type == "vendedor" else "Un corredor recogerá"
+                "description": "El mismo seller recogerá" if transfer_data.pickup_type == "seller" else "Un corredor recogerá"
             },
             "destination_storage": "Exhibición" if transfer_data.destination_type == "exhibicion" else "Bodega"
         },
         "status": "pending",
         "next_steps": [
             "Esperando aceptación del bodeguero",
-            f"{'Vendedor' if transfer_data.pickup_type == 'vendedor' else 'Corredor'} será notificado para recolección",
+            f"{'seller' if transfer_data.pickup_type == 'seller' else 'Corredor'} será notificado para recolección",
             "Transferencia será registrada al completarse"
         ]
     }
@@ -1062,7 +1062,7 @@ async def get_my_transfer_requests(current_user = Depends(get_current_user)):
                 "delivered": "Entregada",
                 "cancelled": "Cancelada"
             }.get(request['status'], "Estado desconocido"),
-            "pickup_person": "El mismo vendedor" if request['pickup_type'] == "vendedor" else "Corredor",
+            "pickup_person": "El mismo seller" if request['pickup_type'] == "seller" else "Corredor",
             "destination": "Exhibición" if request['destination_type'] == "exhibicion" else "Bodega"
         }
     
@@ -1087,8 +1087,8 @@ current_user = Depends(get_current_user)
 ):
     """Gestionar descuento en orden de 5 mil pesos +/- según requerimientos"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo vendedores pueden solicitar descuentos")
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo selleres pueden solicitar descuentos")
     
     # Validar monto (máximo 5000 según requerimientos)
     if discount_data.amount > 5000:
@@ -1188,8 +1188,8 @@ current_user = Depends(get_current_user)
 ):
     """Realizar el mismo flujo para la devolución según requerimientos"""
     
-    if current_user['role'] not in ['vendedor', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo vendedores pueden solicitar devoluciones")
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo selleres pueden solicitar devoluciones")
     
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
