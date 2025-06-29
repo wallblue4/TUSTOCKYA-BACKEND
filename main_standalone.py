@@ -51,6 +51,15 @@ ALGORITHM = "HS256"
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+    print("⚠️ psycopg2 no disponible - solo SQLite funcionará")
+
 # ==================== SCHEMAS ====================
 
 class UserLogin(BaseModel):
@@ -335,6 +344,7 @@ async def get_me(current_user = Depends(get_current_user)):
 
 # ==================== CLASIFICACIÓN ====================
 
+
 def get_db_connection_inventory():
     """Obtener conexión para inventario real"""
     if DATABASE_URL.startswith("sqlite"):
@@ -342,11 +352,12 @@ def get_db_connection_inventory():
         conn.row_factory = sqlite3.Row
         return conn, "sqlite"
     else:
-        import psycopg2
-        import psycopg2.extras
+        if not PSYCOPG2_AVAILABLE:
+            raise Exception("psycopg2 no está disponible para PostgreSQL")
+        
         conn = psycopg2.connect(DATABASE_URL)
         return conn, "postgresql"
-
+        
 def search_products_in_real_inventory(model_name: str, limit: int = 5):
     """Buscar productos en el inventario real basado en el model_name del microservicio"""
     try:
