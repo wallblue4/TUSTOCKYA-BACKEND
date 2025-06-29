@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import random
 import asyncio
+import httpx
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, status, File, UploadFile, Depends
@@ -334,12 +335,228 @@ async def get_me(current_user = Depends(get_current_user)):
 
 # ==================== CLASIFICACIÓN ====================
 
+def get_db_connection_inventory():
+    """Obtener conexión para inventario real"""
+    if DATABASE_URL.startswith("sqlite"):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn, "sqlite"
+    else:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn, "postgresql"
+
+def search_products_in_real_inventory(model_name: str, limit: int = 5):
+    """Buscar productos en el inventario real basado en el model_name del microservicio"""
+    try:
+        conn, db_type = get_db_connection_inventory()
+        
+        if db_type == "sqlite":
+            cursor = conn.execute('''
+                SELECT p.*, 
+                       GROUP_CONCAT(ps.size || '/' || ps.quantity) as sizes_stock,
+                       SUM(ps.quantity) as total_available,
+                       SUM(ps.quantity_exhibition) as total_exhibition
+                FROM products p
+                LEFT JOIN product_sizes ps ON p.id = ps.product_id
+                WHERE p.description LIKE ? OR p.brand LIKE ? OR p.model LIKE ?
+                AND p.is_active = 1
+                GROUP BY p.id
+                ORDER BY total_available DESC
+                LIMIT ?
+            ''', (f'%{model_name}%', f'%{model_name}%', f'%{model_name}%', limit))
+            
+            products = [dict(row) for row in cursor.fetchall()]
+        else:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute('''
+                SELECT p.*, 
+                       STRING_AGG(ps.size || '/' || ps.quantity, ',') as sizes_stock,
+                       SUM(ps.quantity) as total_available,
+                       SUM(ps.quantity_exhibition) as total_exhibition
+                FROM products p
+                LEFT JOIN product_sizes ps ON p.id = ps.product_id
+                WHERE p.description ILIKE %s OR p.brand ILIKE %s OR p.model ILIKE %s
+                AND p.is_active = 1
+                GROUP BY p.id, p.reference_code, p.description, p.brand, p.model, 
+                         p.color_info, p.video_url, p.image_url, p.total_quantity, 
+                         p.location_name, p.unit_price, p.box_price, p.created_at, p.updated_at
+                ORDER BY SUM(ps.quantity) DESC
+                LIMIT %s
+            ''', (f'%{model_name}%', f'%{model_name}%', f'%{model_name}%', limit))
+            
+            products = [dict(row) for row in cursor.fetchall()]
+            cursor.close()
+        
+        conn.close()
+        
+        # Procesar datos para formato del API
+        for product in products:
+            # Parsear tallas
+            if product.get('sizes_stock'):
+                size_pairs = product['sizes_stock'].split(',')
+                stock_by_size = []
+                for pair in size_pairs:
+                    if '/' in pair:
+                        size, qty = pair.split('/')
+                        stock_by_size.append({
+                            "size": size,
+                            "quantity_stock": int(qty),
+                            "quantity_exhibition": 0,  # Se puede mejorar
+                            "location": product['location_name']
+                        })
+                product['parsed_stock'] = stock_by_size
+            else:
+                product['parsed_stock'] = []
+        
+        return products
+        
+    except Exception as e:
+        print(f"Error buscando en inventario real: {e}")
+        return []
+
+async def call_real_classification_service(image_content: bytes, filename: str):
+    """Llamar a tu microservicio real de clasificación"""
+    try:
+        # Tu endpoint real
+        classification_url = "https://sneaker-api-v2.onrender.com/api/v2/classify"
+        
+        # Preparar archivo para upload
+        files = {
+            "image": (filename, image_content, "image/jpeg")
+        }
+        
+        # Llamada al microservicio
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(classification_url, files=files)
+            response.raise_for_status()
+            
+            classification_result = response.json()
+            print(f"🤖 Respuesta del microservicio: {classification_result.get('total_matches_found', 0)} matches")
+            
+            return classification_result
+            
+    except httpx.TimeoutException:
+        print("⏰ Timeout en microservicio de clasificación")
+        return None
+    except httpx.HTTPStatusError as e:
+        print(f"❌ Error HTTP en microservicio: {e.response.status_code}")
+        return None
+    except Exception as e:
+        print(f"❌ Error llamando microservicio: {e}")
+        return None
+
+def merge_classification_with_inventory(classification_result, user_location_id):
+    """Combinar resultados de clasificación con inventario real"""
+    if not classification_result or not classification_result.get('results'):
+        return []
+    
+    merged_results = []
+    
+    for rank, result in enumerate(classification_result['results'][:3], 1):  # Top 3
+        model_name = result.get('model_name', '')
+        
+        # Buscar en inventario real
+        real_products = search_products_in_real_inventory(model_name, limit=2)
+        
+        if real_products:
+            # Usar datos reales si se encuentran
+            for real_product in real_products:
+                merged_result = {
+                    "rank": rank,
+                    "similarity_score": result.get('similarity_score', 0.0),
+                    "confidence_percentage": result.get('confidence_percentage', 0.0),
+                    "confidence_level": result.get('confidence_level', 'low'),
+                    "reference": {
+                        "code": real_product['reference_code'],
+                        "brand": real_product['brand'],
+                        "model": real_product['model'] or "Classic",
+                        "color": real_product['color_info'] or "Varios",
+                        "description": real_product['description'],
+                        "photo": real_product['image_url'] or f"https://via.placeholder.com/300x300?text={real_product['brand']}"
+                    },
+                    "inventory": {
+                        "local_info": {
+                            "location_number": user_location_id,
+                            "location_name": real_product['location_name']
+                        },
+                        "pricing": {
+                            "unit_price": float(real_product['unit_price'] or 0),
+                            "box_price": float(real_product['box_price'] or 0)
+                        },
+                        "stock_by_size": real_product['parsed_stock'],
+                        "total_stock": int(real_product['total_available'] or 0),
+                        "total_exhibition": int(real_product['total_exhibition'] or 0),
+                        "available_sizes": [s['size'] for s in real_product['parsed_stock'] if s['quantity_stock'] > 0],
+                        "other_locations": []  # Se puede expandir
+                    },
+                    "availability": {
+                        "in_stock": int(real_product['total_available'] or 0) > 0,
+                        "can_sell": int(real_product['total_available'] or 0) > 0,
+                        "can_request_from_other_locations": True,
+                        "recommended_action": "Venta disponible en stock local" if int(real_product['total_available'] or 0) > 0 else "Sin stock disponible"
+                    },
+                    "classification_source": "real_microservice",
+                    "inventory_source": "real_database",
+                    "original_db_id": result.get('original_db_id'),
+                    "image_path": result.get('image_path')
+                }
+                merged_results.append(merged_result)
+                break  # Solo el primer match por resultado de clasificación
+        else:
+            # Fallback a datos mock si no se encuentra en inventario
+            merged_result = {
+                "rank": rank,
+                "similarity_score": result.get('similarity_score', 0.0),
+                "confidence_percentage": result.get('confidence_percentage', 0.0),
+                "confidence_level": result.get('confidence_level', 'low'),
+                "reference": {
+                    "code": f"UNKNOWN-{rank:03d}",
+                    "brand": result.get('brand', 'Unknown'),
+                    "model": model_name,
+                    "color": result.get('color', 'Unknown'),
+                    "description": model_name,
+                    "photo": f"https://via.placeholder.com/300x300?text={model_name.replace(' ', '+')}"
+                },
+                "inventory": {
+                    "local_info": {
+                        "location_number": user_location_id,
+                        "location_name": f"Local #{user_location_id}"
+                    },
+                    "pricing": {
+                        "unit_price": float(result.get('price', 0.0)),
+                        "box_price": float(result.get('price', 0.0)) * 0.9
+                    },
+                    "stock_by_size": [],
+                    "total_stock": 0,
+                    "total_exhibition": 0,
+                    "available_sizes": [],
+                    "other_locations": []
+                },
+                "availability": {
+                    "in_stock": False,
+                    "can_sell": False,
+                    "can_request_from_other_locations": True,
+                    "recommended_action": "Producto no encontrado en inventario local"
+                },
+                "classification_source": "real_microservice",
+                "inventory_source": "not_found",
+                "original_db_id": result.get('original_db_id'),
+                "image_path": result.get('image_path')
+            }
+            merged_results.append(merged_result)
+    
+    return merged_results
+
+# main_standalone.py - REEMPLAZAR ENDPOINT DE ESCANEO
+
 @app.post("/api/v1/classify/scan")
-async def scan_sneaker(
+async def scan_sneaker_integrated(
     image: UploadFile = File(...),
     current_user = Depends(get_current_user)
 ):
-    """Escanear tenis - Obtener información completa según requerimientos"""
+    """Escanear tenis usando microservicio real + inventario real"""
     
     start_time = datetime.now()
     
@@ -350,162 +567,118 @@ async def scan_sneaker(
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Archivo muy grande (máximo 10MB)")
     
-    await asyncio.sleep(0.5)  # Simular procesamiento CLIP
+    print(f"🔍 Iniciando escaneo con microservicio real...")
     
-    # Mock results con información completa según requerimientos
-    mock_results = [
-        {
-            "rank": 1,
-            "similarity_score": 0.94,
-            "confidence_percentage": 94.0,
-            "confidence_level": "muy_alta",
-            "reference": {
-                "code": "NK-AM90-WHT-001",
-                "brand": "Nike",
-                "model": "Air Max 90",
-                "color": "Blanco/Negro",
-                "description": "Nike Air Max 90 clásico en colorway blanco con detalles negros",
-                "photo": "https://storage.tustockya.com/sneakers/nike-am90-001.jpg"
+    # Llamar al microservicio real de clasificación
+    classification_result = await call_real_classification_service(content, image.filename)
+    
+    if classification_result and classification_result.get('success'):
+        print(f"✅ Microservicio respondió: {classification_result.get('total_matches_found', 0)} matches")
+        
+        # Combinar con inventario real
+        merged_results = merge_classification_with_inventory(classification_result, current_user['location_id'])
+        
+        processing_time = (datetime.now() - start_time).total_seconds() * 1000
+        
+        return {
+            "success": True,
+            "scan_timestamp": datetime.now().isoformat(),
+            "scanned_by": {
+                "user_id": current_user['id'],
+                "email": current_user['email'],
+                "name": f"{current_user['first_name']} {current_user['last_name']}",
+                "role": current_user['role'],
+                "location_id": current_user['location_id']
             },
-            "inventory": {
-                # Información según requerimientos: ubicación(local #), precio unidad, precio por caja, talla, cantidad, exhibición
-                "local_info": {
-                    "location_number": current_user['location_id'],
-                    "location_name": "Local Principal"
-                },
-                "pricing": {
-                    "unit_price": 120.0,
-                    "box_price": 110.0
-                },
-                "stock_by_size": [
-                    {
-                        "size": "8.5",
-                        "quantity_stock": 3,
-                        "quantity_exhibition": 1,
-                        "location": f"Local #{current_user['location_id']}"
-                    },
-                    {
-                        "size": "9.0", 
-                        "quantity_stock": 5,
-                        "quantity_exhibition": 2,
-                        "location": f"Local #{current_user['location_id']}"
-                    },
-                    {
-                        "size": "9.5",
-                        "quantity_stock": 2,
-                        "quantity_exhibition": 0,
-                        "location": f"Local #{current_user['location_id']}"
-                    }
-                ],
-                "total_stock": 10,
-                "total_exhibition": 3,
-                "available_sizes": ["8.5", "9.0", "9.5"],
-                "other_locations": [
-                    {
-                        "location_id": 2,
-                        "location_name": "Local Norte",
-                        "location_number": 2,
-                        "available_stock": [
-                            {"size": "10.0", "quantity": 4, "exhibition": 1},
-                            {"size": "10.5", "quantity": 2, "exhibition": 0}
-                        ]
-                    },
-                    {
-                        "location_id": 3,
-                        "location_name": "Bodega Central",
-                        "location_number": 3,
-                        "available_stock": [
-                            {"size": "8.0", "quantity": 8, "exhibition": 0},
-                            {"size": "11.0", "quantity": 3, "exhibition": 0}
-                        ]
-                    }
-                ]
+            "user_location": f"Local #{current_user['location_id']}",
+            "best_match": merged_results[0] if merged_results else None,
+            "alternative_matches": merged_results[1:] if len(merged_results) > 1 else [],
+            "total_matches_found": len(merged_results),
+            "processing_time_ms": round(processing_time, 2),
+            "image_info": {
+                "filename": image.filename,
+                "size_bytes": len(content),
+                "content_type": image.content_type
             },
-            "availability": {
-                "in_stock": True,
-                "can_sell": True,
-                "can_request_from_other_locations": True,
-                "recommended_action": "Venta disponible en stock local"
-            }
-        },
-        {
-            "rank": 2,
-            "similarity_score": 0.87,
-            "confidence_percentage": 87.0,
-            "confidence_level": "alta",
-            "reference": {
-                "code": "AD-UB22-BLK-001",
-                "brand": "Adidas",
-                "model": "Ultraboost 22",
-                "color": "Negro",
-                "description": "Adidas Ultraboost 22 en colorway triple negro",
-                "photo": "https://storage.tustockya.com/sneakers/adidas-ub22-001.jpg"
+            "classification_service": {
+                "service": "real_microservice",
+                "url": "https://sneaker-api-v2.onrender.com/api/v2/classify",
+                "model": classification_result.get('model_info', {}).get('model', 'jina-clip-v2'),
+                "total_database_matches": classification_result.get('total_matches_found', 0)
             },
-            "inventory": {
-                "local_info": {
-                    "location_number": current_user['location_id'],
-                    "location_name": "Local Principal"
-                },
-                "pricing": {
-                    "unit_price": 180.0,
-                    "box_price": 170.0
-                },
-                "stock_by_size": [
-                    {
-                        "size": "9.0",
-                        "quantity_stock": 0,
-                        "quantity_exhibition": 1,
-                        "location": f"Local #{current_user['location_id']}"
-                    }
-                ],
-                "total_stock": 0,
-                "total_exhibition": 1,
-                "available_sizes": [],
-                "other_locations": [
-                    {
-                        "location_id": 3,
-                        "location_name": "Bodega Central",
-                        "location_number": 3,
-                        "available_stock": [
-                            {"size": "8.5", "quantity": 5, "exhibition": 0},
-                            {"size": "9.0", "quantity": 3, "exhibition": 0},
-                            {"size": "9.5", "quantity": 3, "exhibition": 0}
-                        ]
-                    }
-                ]
-            },
-            "availability": {
-                "in_stock": False,
-                "can_sell": False,
-                "can_request_from_other_locations": True,
-                "recommended_action": "Solicitar transferencia de Bodega Central"
+            "inventory_service": {
+                "source": "real_database",
+                "products_found": len([r for r in merged_results if r.get('inventory_source') == 'real_database']),
+                "locations_checked": [current_user['location_id']]
             }
         }
-    ]
-    
-    processing_time = (datetime.now() - start_time).total_seconds() * 1000
-    
-    return {
-        "success": True,
-        "scan_timestamp": datetime.now().isoformat(),
-        "scanned_by": {
-            "user_id": current_user['id'],
-            "email": current_user['email'],
-            "name": f"{current_user['first_name']} {current_user['last_name']}",
-            "role": current_user['role'],
-            "location_id": current_user['location_id']
-        },
-        "user_location": f"Local #{current_user['location_id']}",
-        "best_match": mock_results[0],
-        "alternative_matches": mock_results[1:],
-        "total_matches_found": len(mock_results),
-        "processing_time_ms": round(processing_time, 2),
-        "image_info": {
-            "filename": image.filename,
-            "size_bytes": len(content),
-            "content_type": image.content_type
+    else:
+        # Fallback a mock si el microservicio falla
+        print("⚠️ Microservicio no disponible, usando datos mock")
+        
+        # Tu código mock actual aquí como fallback
+        mock_results = [
+            {
+                "rank": 1,
+                "similarity_score": 0.50,
+                "confidence_percentage": 50.0,
+                "confidence_level": "medium",
+                "reference": {
+                    "code": "FALLBACK-001",
+                    "brand": "Unknown",
+                    "model": "Sistema en mantenimiento",
+                    "color": "N/A",
+                    "description": "Microservicio de clasificación temporalmente no disponible",
+                    "photo": "https://via.placeholder.com/300x300?text=Sistema+en+Mantenimiento"
+                },
+                "inventory": {
+                    "local_info": {
+                        "location_number": current_user['location_id'],
+                        "location_name": f"Local #{current_user['location_id']}"
+                    },
+                    "pricing": {"unit_price": 0.0, "box_price": 0.0},
+                    "stock_by_size": [],
+                    "total_stock": 0,
+                    "total_exhibition": 0,
+                    "available_sizes": []
+                },
+                "availability": {
+                    "in_stock": False,
+                    "can_sell": False,
+                    "can_request_from_other_locations": False,
+                    "recommended_action": "Sistema de clasificación en mantenimiento"
+                }
+            }
+        ]
+        
+        processing_time = (datetime.now() - start_time).total_seconds() * 1000
+        
+        return {
+            "success": True,
+            "scan_timestamp": datetime.now().isoformat(),
+            "scanned_by": {
+                "user_id": current_user['id'],
+                "email": current_user['email'],
+                "name": f"{current_user['first_name']} {current_user['last_name']}",
+                "role": current_user['role'],
+                "location_id": current_user['location_id']
+            },
+            "user_location": f"Local #{current_user['location_id']}",
+            "best_match": mock_results[0],
+            "alternative_matches": [],
+            "total_matches_found": 1,
+            "processing_time_ms": round(processing_time, 2),
+            "image_info": {
+                "filename": image.filename,
+                "size_bytes": len(content),
+                "content_type": image.content_type
+            },
+            "classification_service": {
+                "service": "fallback_mock",
+                "status": "microservice_unavailable",
+                "message": "Usando datos mock como respaldo"
+            }
         }
-    }
 
 @app.get("/api/v1/classify/health")
 async def classification_health():

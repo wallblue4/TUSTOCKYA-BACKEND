@@ -1,0 +1,41 @@
+
+services:
+  # Tu aplicación
+  app:
+    build: .
+    ports:
+      - "8000:10000"
+    environment:
+      - USE_CLIP_CPU=true
+      - DATABASE_URL=sqlite:///./data/tustockya.db
+      - SECRET_KEY=local-secret-key
+      - PORT=10000
+      - TORCH_NUM_THREADS=4
+      - OMP_NUM_THREADS=4
+    volumes:
+      - ./data:/app/data
+      - ./test_images:/app/test_images
+    depends_on:
+      - postgres
+      - redis
+
+  # PostgreSQL para testing
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: tustockya
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: tustockya_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Redis para cache
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
