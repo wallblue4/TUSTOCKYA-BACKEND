@@ -6,10 +6,10 @@ import enum
 from app.core.database import Base
 
 class UserRole(enum.Enum):
-    vendedor = "vendedor"
+    vendedor = "seller"
     corredor = "corredor"
     bodeguero = "bodeguero"
-    administrador = "administrador"
+    administrador = "admin"
 
 class User(Base):
     __tablename__ = "users"

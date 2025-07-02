@@ -37,7 +37,7 @@ class AuthService:
             user = cursor.fetchone()
             return dict(user) if user else None
     
-    def create_user(self, email: str, password: str, first_name: str, last_name: str, role: str = "vendedor", location_id: int = None) -> dict:
+    def create_user(self, email: str, password: str, first_name: str, last_name: str, role: str = "seller", location_id: int = None) -> dict:
         """Crear nuevo usuario"""
         password_hash = get_password_hash(password)
         

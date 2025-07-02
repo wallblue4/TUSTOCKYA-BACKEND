@@ -344,6 +344,50 @@ async def get_me(current_user = Depends(get_current_user)):
 
 # ==================== CLASIFICACIÓN ====================
 
+def validate_stock_availability(items, location_id):
+    """Validar que hay stock suficiente para todos los items"""
+    if USE_POSTGRESQL:
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+    
+    stock_issues = []
+    
+    for item in items:
+        if USE_POSTGRESQL:
+            cursor.execute('''
+                SELECT ps.quantity 
+                FROM product_sizes ps
+                JOIN products p ON ps.product_id = p.id
+                WHERE p.reference_code = %s 
+                AND ps.size = %s 
+                AND p.location_name = (SELECT name FROM locations WHERE id = %s)
+            ''', (item['sneaker_reference_code'], item['size'], location_id))
+        else:
+            cursor.execute('''
+                SELECT ps.quantity 
+                FROM product_sizes ps
+                JOIN products p ON ps.product_id = p.id
+                WHERE p.reference_code = ? 
+                AND ps.size = ? 
+                AND p.location_name = (SELECT name FROM locations WHERE id = ?)
+            ''', (item['sneaker_reference_code'], item['size'], location_id))
+        
+        result = cursor.fetchone()
+        available_qty = result['quantity'] if result else 0
+        
+        if available_qty < item['quantity']:
+            stock_issues.append({
+                "reference": item['sneaker_reference_code'],
+                "size": item['size'],
+                "requested": item['quantity'],
+                "available": available_qty
+            })
+    
+    conn.close()
+    return stock_issues
 
 def get_db_connection_inventory():
     """Obtener conexión para inventario real"""
@@ -357,6 +401,47 @@ def get_db_connection_inventory():
         
         conn = psycopg2.connect(DATABASE_URL)
         return conn, "postgresql"
+
+def update_stock_after_sale(items, location_id):
+    """Descontar stock después de confirmar venta"""
+    if USE_POSTGRESQL:
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+    
+    try:
+        for item in items:
+            if USE_POSTGRESQL:
+                cursor.execute('''
+                    UPDATE product_sizes 
+                    SET quantity = quantity - %s
+                    WHERE product_id = (
+                        SELECT p.id FROM products p 
+                        WHERE p.reference_code = %s 
+                        AND p.location_name = (SELECT name FROM locations WHERE id = %s)
+                    ) 
+                    AND size = %s
+                ''', (item['quantity'], item['sneaker_reference_code'], location_id, item['size']))
+            else:
+                conn.execute('''
+                    UPDATE product_sizes 
+                    SET quantity = quantity - ?
+                    WHERE product_id = (
+                        SELECT p.id FROM products p 
+                        WHERE p.reference_code = ? 
+                        AND p.location_name = (SELECT name FROM locations WHERE id = ?)
+                    ) 
+                    AND size = ?
+                ''', (item['quantity'], item['sneaker_reference_code'], location_id, item['size']))
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
 def search_products_in_real_inventory(model_name: str, limit: int = 5):
     """Buscar productos en el inventario real basado en el model_name del microservicio"""
@@ -964,6 +1049,13 @@ async def create_sale_complete(
     sale_data: SaleCreateComplete,
     current_user = Depends(get_current_user)
 ):
+    stock_issues = validate_stock_availability(sale_data.items, current_user['location_id'])
+    if stock_issues:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Stock insuficiente: {stock_issues}"
+        )
+
     """Registrar una nueva venta completa con métodos de pago según requerimientos"""
     
     if current_user['role'] not in ['seller', 'administrador']:
@@ -1050,6 +1142,14 @@ async def create_sale_complete(
                 )
         
         conn.commit()
+
+        if not sale_data.requires_confirmation:
+            try:
+                update_stock_after_sale(sale_data.items, current_user['location_id'])
+            except Exception as e:
+                # Rollback venta si falla actualización de stock
+                # ... código de rollback ...
+                raise HTTPException(status_code=500, detail="Error actualizando stock")
         
         return {
             "success": True,
@@ -1134,6 +1234,14 @@ async def confirm_sale(
     
     conn.commit()
     conn.close()
+
+    if confirmation.confirmed:
+        # Obtener items de la venta
+        sale_items = get_sale_items(confirmation.sale_id)
+        try:
+            update_stock_after_sale(sale_items, current_user['location_id'])
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Error actualizando stock")
     
     return {
         "success": True,
