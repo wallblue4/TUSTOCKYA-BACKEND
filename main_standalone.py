@@ -871,7 +871,7 @@ async def get_vendor_dashboard_complete(current_user = Depends(get_current_user)
                WHERE tr.requester_id = %s AND rn.read_by_requester = FALSE''',
             (current_user['id'],)
         )
-        unread_returns = cursor.fetchone()[0]
+        unread_returns = cursor.fetchone()['count'] 
         
     else:
         # SQLite (código original)
