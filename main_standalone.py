@@ -936,12 +936,12 @@ async def get_vendor_dashboard_complete(current_user = Depends(get_current_user)
         # Notificaciones de devolución no leídas
         cursor = conn.execute(
             '''SELECT COUNT(*) as count 
-               FROM return_notifications rn
-               JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
-               WHERE tr.requester_id = ? AND rn.read_by_requester = 0''',
+            FROM return_notifications rn
+            JOIN transfer_requests tr ON rn.transfer_request_id = tr.id
+            WHERE tr.requester_id = ? AND rn.read_by_requester = 0''',
             (current_user['id'],)
         )
-        unread_returns = cursor.fetchone()[0]
+        unread_returns = cursor.fetchone()['count'] 
     
     conn.close()
     
