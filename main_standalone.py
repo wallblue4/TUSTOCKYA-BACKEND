@@ -377,6 +377,8 @@ def validate_stock_availability(items, location_id):
         
         result = cursor.fetchone()
         available_qty = result['quantity'] if result else 0
+
+        print(available_qty)
         
         if available_qty < item['quantity']:
             stock_issues.append({
