@@ -1051,12 +1051,12 @@ async def create_sale_complete(
     sale_data: SaleCreateComplete,
     current_user = Depends(get_current_user)
 ):
-    stock_issues = validate_stock_availability(sale_data.items, current_user['location_id'])
-    if stock_issues:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Stock insuficiente: {stock_issues}"
-        )
+   # stock_issues = validate_stock_availability(sale_data.items, current_user['location_id'])
+   # if stock_issues:
+   #     raise HTTPException(
+    #        status_code=400, 
+     #       detail=f"Stock insuficiente: {stock_issues}"
+    #    )
 
     """Registrar una nueva venta completa con métodos de pago según requerimientos"""
     
