@@ -14,6 +14,11 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt
+import cloudinary
+import cloudinary.uploader
+from cloudinary.exceptions import Error as CloudinaryError
+import io
+from PIL import Image
 
 # ==================== CONFIGURACIÓN PARA RAILWAY ====================
 
@@ -22,6 +27,15 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/tustockya.db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-cambia-en-produccion")
 PORT = int(os.getenv("PORT", "10000"))  # Render usa puerto 10000 por defecto
+
+
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
 
 
 # Configuración de base de datos
@@ -174,6 +188,74 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail="Usuario no encontrado")
     
     return dict(user)
+
+async def upload_receipt_to_cloudinary(
+    file: UploadFile, 
+    receipt_type: str,  # 'sale' o 'expense'
+    user_id: int,
+    record_id: str = None  # ID de venta o gasto
+) -> str:
+    """
+    Subir comprobante a Cloudinary y retornar solo la URL
+    """
+    try:
+        # Leer y validar archivo
+        content = await file.read()
+        
+        if len(content) > MAX_IMAGE_SIZE:
+            raise HTTPException(status_code=413, detail="Imagen muy grande (máximo 10MB)")
+        
+        if not file.content_type or file.content_type not in ALLOWED_IMAGE_FORMATS:
+            raise HTTPException(status_code=400, detail="Formato no válido")
+        
+        # Optimizar imagen
+        img = Image.open(io.BytesIO(content))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        
+        # Redimensionar si es muy grande
+        if img.width > 1920:
+            ratio = 1920 / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((1920, new_height), Image.Resampling.LANCZOS)
+        
+        # Guardar optimizada en memoria
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=85, optimize=True)
+        optimized_content = output.getvalue()
+        
+        # Generar ID único
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        public_id = f"{CLOUDINARY_FOLDER}/receipts/{receipt_type}/{timestamp}_{user_id}_{unique_id}"
+        
+        # Subir a Cloudinary
+        upload_result = cloudinary.uploader.upload(
+            optimized_content,
+            public_id=public_id,
+            tags=[
+                "tustockya",
+                receipt_type,
+                f"user_{user_id}",
+                f"record_{record_id}" if record_id else f"temp_{unique_id}"
+            ],
+            folder=f"{CLOUDINARY_FOLDER}/receipts/{receipt_type}",
+            resource_type="image",
+            format="jpg",
+            quality="auto:good",
+            transformation=[
+                {"width": 1920, "height": 1920, "crop": "limit"},
+                {"quality": "auto:good"}
+            ]
+        )
+        
+        return upload_result["secure_url"]
+        
+    except CloudinaryError as e:
+        raise HTTPException(status_code=500, detail=f"Error subiendo imagen: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando imagen: {str(e)}")
+
 
 # ==================== CONFIGURACIÓN FASTAPI ====================
 
@@ -1048,39 +1130,57 @@ async def get_locations(current_user = Depends(get_current_user)):
 # VENTAS COMPLETAS CON MÉTODOS DE PAGO
 @app.post("/api/v1/sales/create")
 async def create_sale_complete(
-    sale_data: SaleCreateComplete,
+    # Datos del formulario
+    items: str,  # JSON string de items
+    total_amount: float,
+    payment_methods: str,  # JSON string de métodos de pago
+    notes: str = "",
+    requires_confirmation: bool = False,
+    # Archivo de imagen (opcional)
+    receipt_image: UploadFile = File(None),
     current_user = Depends(get_current_user)
 ):
-   # stock_issues = validate_stock_availability(sale_data.items, current_user['location_id'])
-   # if stock_issues:
-   #     raise HTTPException(
-    #        status_code=400, 
-     #       detail=f"Stock insuficiente: {stock_issues}"
-    #    )
-
-    """Registrar una nueva venta completa con métodos de pago según requerimientos"""
+    """Registrar venta completa - CON IMAGEN EN EL MISMO ENDPOINT"""
     
     if current_user['role'] not in ['seller', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo selleres pueden registrar ventas")
+        raise HTTPException(status_code=403, detail="Solo vendedores pueden registrar ventas")
+    
+    try:
+        # Parsear datos JSON
+        import json
+        items_data = json.loads(items)
+        payment_methods_data = json.loads(payment_methods)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Datos JSON inválidos")
     
     # Validar que los métodos de pago sumen el total
-    total_payments = sum(payment.amount for payment in sale_data.payment_methods)
-    if abs(total_payments - sale_data.total_amount) > 0.01:  # Tolerancia de 1 centavo
+    total_payments = sum(payment['amount'] for payment in payment_methods_data)
+    if abs(total_payments - total_amount) > 0.01:
         raise HTTPException(
             status_code=400, 
-            detail=f"Los métodos de pago (${total_payments:.2f}) no coinciden con el total (${sale_data.total_amount:.2f})"
+            detail=f"Los métodos de pago (${total_payments:.2f}) no coinciden con el total (${total_amount:.2f})"
         )
     
+    # Subir imagen a Cloudinary si existe
+    receipt_url = None
+    if receipt_image and receipt_image.filename:
+        print(f"📸 Subiendo comprobante de venta...")
+        receipt_url = await upload_receipt_to_cloudinary(
+            receipt_image, 
+            "sale", 
+            current_user['id']
+        )
+        print(f"✅ Comprobante subido: {receipt_url}")
+    
+    # Guardar en base de datos
     if USE_POSTGRESQL:
         import psycopg2
-        import psycopg2.extras
         conn = psycopg2.connect(DB_PATH)
         cursor = conn.cursor()
     else:
         conn = sqlite3.connect(DB_PATH)
     
     try:
-        # Crear la venta con hora de venta y confirmación
         sale_timestamp = datetime.now().isoformat()
         
         if USE_POSTGRESQL:
@@ -1088,10 +1188,10 @@ async def create_sale_complete(
                 '''INSERT INTO sales (seller_id, location_id, total_amount, receipt_image, notes, 
                                     requires_confirmation, confirmed, confirmed_at, sale_date)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
-                (current_user['id'], current_user['location_id'], sale_data.total_amount, 
-                 sale_data.receipt_image, sale_data.notes, sale_data.requires_confirmation,
-                 not sale_data.requires_confirmation,  # Si no requiere confirmación, ya está confirmada
-                 None if sale_data.requires_confirmation else sale_timestamp,
+                (current_user['id'], current_user['location_id'], total_amount, 
+                 receipt_url, notes, requires_confirmation,
+                 not requires_confirmation,
+                 None if requires_confirmation else sale_timestamp,
                  sale_timestamp)
             )
             sale_id = cursor.fetchone()[0]
@@ -1100,31 +1200,31 @@ async def create_sale_complete(
                 '''INSERT INTO sales (seller_id, location_id, total_amount, receipt_image, notes, 
                                     requires_confirmation, confirmed, confirmed_at, sale_date)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (current_user['id'], current_user['location_id'], sale_data.total_amount, 
-                 sale_data.receipt_image, sale_data.notes, sale_data.requires_confirmation,
-                 not sale_data.requires_confirmation,
-                 None if sale_data.requires_confirmation else sale_timestamp,
+                (current_user['id'], current_user['location_id'], total_amount, 
+                 receipt_url, notes, requires_confirmation,
+                 not requires_confirmation,
+                 None if requires_confirmation else sale_timestamp,
                  sale_timestamp)
             )
             sale_id = cursor.lastrowid
         
         # Crear los métodos de pago
-        for payment in sale_data.payment_methods:
+        for payment in payment_methods_data:
             if USE_POSTGRESQL:
                 cursor.execute(
                     '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
                        VALUES (%s, %s, %s, %s)''',
-                    (sale_id, payment.type, payment.amount, payment.reference)
+                    (sale_id, payment['type'], payment['amount'], payment.get('reference'))
                 )
             else:
                 conn.execute(
                     '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
                        VALUES (?, ?, ?, ?)''',
-                    (sale_id, payment.type, payment.amount, payment.reference)
+                    (sale_id, payment['type'], payment['amount'], payment.get('reference'))
                 )
         
         # Crear los items de la venta
-        for item in sale_data.items:
+        for item in items_data:
             subtotal = item['quantity'] * item['unit_price']
             if USE_POSTGRESQL:
                 cursor.execute(
@@ -1144,30 +1244,28 @@ async def create_sale_complete(
                 )
         
         conn.commit()
-
-        if not sale_data.requires_confirmation:
+        
+        # Actualizar stock si no requiere confirmación
+        if not requires_confirmation:
             try:
-                update_stock_after_sale(sale_data.items, current_user['location_id'])
+                update_stock_after_sale(items_data, current_user['location_id'])
             except Exception as e:
-                # Rollback venta si falla actualización de stock
-                # ... código de rollback ...
-                raise HTTPException(status_code=500, detail="Error actualizando stock")
+                print(f"⚠️ Error actualizando stock: {e}")
         
         return {
             "success": True,
             "sale_id": sale_id,
             "message": "Venta registrada exitosamente",
-            "sale_timestamp": sale_timestamp,  # Hora de la venta
-            "total_amount": sale_data.total_amount,
-            "items_count": len(sale_data.items),
-            "payment_methods_count": len(sale_data.payment_methods),
-            "payment_breakdown": [
-                {"type": p.type, "amount": p.amount, "reference": p.reference} 
-                for p in sale_data.payment_methods
-            ],
-            "status": "pending_confirmation" if sale_data.requires_confirmation else "confirmed",
-            "requires_confirmation": sale_data.requires_confirmation,
-            "has_receipt": bool(sale_data.receipt_image)
+            "sale_timestamp": sale_timestamp,
+            "total_amount": total_amount,
+            "items_count": len(items_data),
+            "payment_methods_count": len(payment_methods_data),
+            "receipt_info": {
+                "has_receipt": bool(receipt_url),
+                "receipt_url": receipt_url,
+                "stored_in": "Cloudinary CDN" if receipt_url else None
+            },
+            "status": "pending_confirmation" if requires_confirmation else "confirmed"
         }
         
     except Exception as e:
@@ -1436,14 +1534,34 @@ async def get_pending_confirmation_sales(current_user = Depends(get_current_user
 # GASTOS
 @app.post("/api/v1/expenses/create")
 async def create_expense(
-    expense_data: ExpenseCreate,
+    # Datos del formulario
+    concept: str,
+    amount: float,
+    notes: str = "",
+    # Archivo de imagen (opcional)
+    receipt_image: UploadFile = File(None),
     current_user = Depends(get_current_user)
 ):
-    """Registrar gasto (concepto del gasto, valor, comprobante) según requerimientos"""
+    """Registrar gasto - CON IMAGEN EN EL MISMO ENDPOINT"""
     
     if current_user['role'] not in ['seller', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo selleres pueden registrar gastos")
+        raise HTTPException(status_code=403, detail="Solo vendedores pueden registrar gastos")
     
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
+    
+    # Subir imagen a Cloudinary si existe
+    receipt_url = None
+    if receipt_image and receipt_image.filename:
+        print(f"📸 Subiendo comprobante de gasto...")
+        receipt_url = await upload_receipt_to_cloudinary(
+            receipt_image, 
+            "expense", 
+            current_user['id']
+        )
+        print(f"✅ Comprobante subido: {receipt_url}")
+    
+    # Guardar en base de datos
     if USE_POSTGRESQL:
         import psycopg2
         conn = psycopg2.connect(DB_PATH)
@@ -1453,40 +1571,47 @@ async def create_expense(
     
     expense_timestamp = datetime.now().isoformat()
     
-    if USE_POSTGRESQL:
-        cursor.execute(
-            '''INSERT INTO expenses (user_id, location_id, concept, amount, receipt_image, notes, expense_date)
-               VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id''',
-            (current_user['id'], current_user['location_id'], expense_data.concept, 
-             expense_data.amount, expense_data.receipt_image, expense_data.notes, expense_timestamp)
-        )
-        expense_id = cursor.fetchone()[0]
-    else:
-        cursor = conn.execute(
-            '''INSERT INTO expenses (user_id, location_id, concept, amount, receipt_image, notes, expense_date)
-               VALUES (?, ?, ?, ?, ?, ?, ?)''',
-            (current_user['id'], current_user['location_id'], expense_data.concept, 
-             expense_data.amount, expense_data.receipt_image, expense_data.notes, expense_timestamp)
-        )
-        expense_id = cursor.lastrowid
-    
-    conn.commit()
-    conn.close()
-    print(f"✅ Gasto registrado: {expense_data.concept} ({expense_data.amount})")
-    
-    return {
-        "success": True,
-        "expense_id": expense_id,
-        "message": "Gasto registrado exitosamente",
-        "expense_timestamp": expense_timestamp,
-        "expense_details": {
-            "concept": expense_data.concept,
-            "amount": expense_data.amount,
-            "has_receipt": bool(expense_data.receipt_image),
-            "notes": expense_data.notes
-        },
-        "registered_by": f"{current_user['first_name']} {current_user['last_name']}"
-    }
+    try:
+        if USE_POSTGRESQL:
+            cursor.execute(
+                '''INSERT INTO expenses (user_id, location_id, concept, amount, receipt_image, notes, expense_date)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                (current_user['id'], current_user['location_id'], concept, 
+                 amount, receipt_url, notes, expense_timestamp)
+            )
+            expense_id = cursor.fetchone()[0]
+        else:
+            cursor = conn.execute(
+                '''INSERT INTO expenses (user_id, location_id, concept, amount, receipt_image, notes, expense_date)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                (current_user['id'], current_user['location_id'], concept, 
+                 amount, receipt_url, notes, expense_timestamp)
+            )
+            expense_id = cursor.lastrowid
+        
+        conn.commit()
+        
+        return {
+            "success": True,
+            "expense_id": expense_id,
+            "message": "Gasto registrado exitosamente",
+            "expense_timestamp": expense_timestamp,
+            "expense_details": {
+                "concept": concept,
+                "amount": amount,
+                "has_receipt": bool(receipt_url),
+                "receipt_url": receipt_url,
+                "stored_in": "Cloudinary CDN" if receipt_url else None,
+                "notes": notes
+            },
+            "registered_by": f"{current_user['first_name']} {current_user['last_name']}"
+        }
+        
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Error registrando gasto: {str(e)}")
+    finally:
+        conn.close()
 
 @app.get("/api/v1/expenses/today")
 async def get_today_expenses(current_user = Depends(get_current_user)):
@@ -2079,6 +2204,50 @@ async def mark_return_notification_read(
         "message": "Notificación marcada como leída",
         "notification_id": notification_id
     }
+
+
+@app.get("/api/v1/cloudinary/status")
+async def cloudinary_status():
+    """Verificar estado de Cloudinary"""
+    
+    config_vars = ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
+    missing = [var for var in config_vars if not os.getenv(var)]
+    
+    if missing:
+        return {
+            "success": False,
+            "configured": False,
+            "missing_variables": missing,
+            "message": "Cloudinary no configurado"
+        }
+    
+    try:
+        # Test de conexión
+        test_result = cloudinary.api.ping()
+        
+        return {
+            "success": True,
+            "configured": True,
+            "cloud_name": os.getenv("CLOUDINARY_CLOUD_NAME"),
+            "folder": CLOUDINARY_FOLDER,
+            "connection": "ok",
+            "features": [
+                "Upload directo en endpoints de venta/gasto",
+                "Optimización automática de imágenes",
+                "CDN global",
+                "No requiere endpoints separados"
+            ]
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "configured": True,
+            "connection": "error",
+            "error": str(e)
+        }
+
+
     # ==================== FUNCIONES AUXILIARES PARA TESTING ====================
 
 @app.post("/api/v1/admin/create-test-data")

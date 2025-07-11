@@ -16,9 +16,11 @@ python-dateutil==2.8.2
 aiofiles==23.2.1
 httpx>=0.25.0
 
+cloudinary==1.36.0
+
 # Procesamiento básico de imágenes (solo si necesario)
 Pillow==10.1.0
-numpy==1.24.4
+#numpy==1.24.4
 
 # Web server
 gunicorn==21.2.0
