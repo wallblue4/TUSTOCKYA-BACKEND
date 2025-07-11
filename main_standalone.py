@@ -39,6 +39,8 @@ cloudinary.config(
     secure=True
 )
 
+CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "tustockya")
+
 
 # Configuración de base de datos
 # Detectar si estamos en Render (siempre usar PostgreSQL)
