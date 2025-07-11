@@ -34,3 +34,5 @@ Thumbs.db
 
 # Backups
 *_backup.py
+
+env.example

@@ -16,6 +16,8 @@ from passlib.context import CryptContext
 from jose import jwt
 import cloudinary
 import cloudinary.uploader
+import cloudinary.api 
+import cloudinary.utils
 from cloudinary.exceptions import Error as CloudinaryError
 import io
 from PIL import Image
@@ -255,6 +257,34 @@ async def upload_receipt_to_cloudinary(
         raise HTTPException(status_code=500, detail=f"Error subiendo imagen: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando imagen: {str(e)}")
+
+def validate_cloudinary_config() -> bool:
+    """Verificar que Cloudinary está configurado correctamente - VERSIÓN CORREGIDA"""
+    required_vars = ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing:
+        print(f"⚠️ Variables de Cloudinary faltantes: {missing}")
+        return False
+    
+    try:
+        # Configurar primero
+        cloudinary.config(
+            cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+            api_key=os.getenv("CLOUDINARY_API_KEY"),
+            api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+            secure=True
+        )
+        
+        # Test básico de conexión - AHORA SÍ FUNCIONA
+        result = cloudinary.api.ping()
+        print("✅ Cloudinary conectado correctamente")
+        print(f"✅ Status: {result.get('status', 'unknown')}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error conectando a Cloudinary: {e}")
+        return False
 
 
 # ==================== CONFIGURACIÓN FASTAPI ====================
@@ -2208,7 +2238,7 @@ async def mark_return_notification_read(
 
 @app.get("/api/v1/cloudinary/status")
 async def cloudinary_status():
-    """Verificar estado de Cloudinary"""
+    """Verificar estado de Cloudinary - VERSIÓN CORREGIDA"""
     
     config_vars = ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
     missing = [var for var in config_vars if not os.getenv(var)]
@@ -2218,25 +2248,57 @@ async def cloudinary_status():
             "success": False,
             "configured": False,
             "missing_variables": missing,
-            "message": "Cloudinary no configurado"
+            "message": "Cloudinary no configurado - faltan variables de entorno"
         }
     
     try:
-        # Test de conexión
-        test_result = cloudinary.api.ping()
+        # Asegurar configuración
+        cloudinary.config(
+            cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+            api_key=os.getenv("CLOUDINARY_API_KEY"),
+            api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+            secure=True
+        )
+        
+        # Test de conexión mejorado
+        ping_result = cloudinary.api.ping()
+        
+        # Obtener información adicional si es posible
+        try:
+            usage_info = cloudinary.api.usage()
+        except Exception:
+            usage_info = None
         
         return {
             "success": True,
             "configured": True,
-            "cloud_name": os.getenv("CLOUDINARY_CLOUD_NAME"),
-            "folder": CLOUDINARY_FOLDER,
             "connection": "ok",
+            "cloudinary_status": {
+                "cloud_name": os.getenv("CLOUDINARY_CLOUD_NAME"),
+                "folder": CLOUDINARY_FOLDER,
+                "ping_status": ping_result.get("status", "unknown"),
+                "api_version": getattr(cloudinary, '__version__', 'unknown')
+            },
+            "usage_stats": {
+                "credits_used": usage_info.get("credits", {}).get("used", 0) if usage_info else "unavailable",
+                "storage_used_mb": round(usage_info.get("storage", {}).get("used", 0) / 1024 / 1024, 2) if usage_info else "unavailable",
+                "transformations_used": usage_info.get("transformations", {}).get("used", 0) if usage_info else "unavailable"
+            } if usage_info else "unavailable",
             "features": [
                 "Upload directo en endpoints de venta/gasto",
-                "Optimización automática de imágenes",
+                "Optimización automática de imágenes", 
                 "CDN global",
-                "No requiere endpoints separados"
+                "Transformaciones en tiempo real"
             ]
+        }
+        
+    except ImportError as e:
+        return {
+            "success": False,
+            "configured": True,
+            "connection": "import_error",
+            "error": f"Error de importación: {str(e)}",
+            "solution": "Reinstalar cloudinary: pip install cloudinary"
         }
         
     except Exception as e:
@@ -2244,7 +2306,12 @@ async def cloudinary_status():
             "success": False,
             "configured": True,
             "connection": "error",
-            "error": str(e)
+            "error": str(e),
+            "cloudinary_config": {
+                "cloud_name": os.getenv("CLOUDINARY_CLOUD_NAME", "not_set"),
+                "api_key_set": bool(os.getenv("CLOUDINARY_API_KEY")),
+                "api_secret_set": bool(os.getenv("CLOUDINARY_API_SECRET"))
+            }
         }
 
 
@@ -2363,6 +2430,58 @@ async def create_test_data(current_user = Depends(get_current_user)):
         conn.close()
 
     # ==================== EJECUTAR APLICACIÓN ====================
+
+def test_cloudinary_manually():
+    """Función para testear Cloudinary por separado"""
+    
+    print("🧪 Testing Cloudinary step by step...")
+    
+    # 1. Verificar importaciones
+    try:
+        import cloudinary
+        import cloudinary.api
+        import cloudinary.uploader
+        print("✅ Imports OK")
+    except ImportError as e:
+        print(f"❌ Import error: {e}")
+        return False
+    
+    # 2. Verificar variables
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
+    api_key = os.getenv("CLOUDINARY_API_KEY")
+    api_secret = os.getenv("CLOUDINARY_API_SECRET")
+    
+    print(f"📋 Cloud name: {cloud_name}")
+    print(f"📋 API key: {api_key[:10]}..." if api_key else "❌ Not set")
+    print(f"📋 API secret: {'✅ Set' if api_secret else '❌ Not set'}")
+    
+    if not all([cloud_name, api_key, api_secret]):
+        print("❌ Missing environment variables")
+        return False
+    
+    # 3. Configurar
+    try:
+        cloudinary.config(
+            cloud_name=cloud_name,
+            api_key=api_key,
+            api_secret=api_secret,
+            secure=True
+        )
+        print("✅ Config OK")
+    except Exception as e:
+        print(f"❌ Config error: {e}")
+        return False
+    
+    # 4. Test ping
+    try:
+        result = cloudinary.api.ping()
+        print(f"✅ Ping OK: {result}")
+        return True
+    except Exception as e:
+        print(f"❌ Ping error: {e}")
+        return False
+
+
 
 # ==================== INICIALIZACIÓN DE BD ====================
 
@@ -2669,6 +2788,7 @@ if __name__ == "__main__":
     init_database_if_needed()
     
     environment = "Railway" if os.getenv("RAILWAY_ENVIRONMENT") else "Local"
+     test_cloudinary_manually()
     
     print("🚀 Iniciando TuStockYa Backend")
     print("=" * 60)
