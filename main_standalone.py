@@ -2788,7 +2788,7 @@ if __name__ == "__main__":
     init_database_if_needed()
     
     environment = "Railway" if os.getenv("RAILWAY_ENVIRONMENT") else "Local"
-     test_cloudinary_manually()
+    test_cloudinary_manually()
     
     print("🚀 Iniciando TuStockYa Backend")
     print("=" * 60)
