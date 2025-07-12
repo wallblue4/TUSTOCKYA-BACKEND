@@ -43,6 +43,9 @@ cloudinary.config(
 )
 
 CLOUDINARY_FOLDER = os.getenv("CLOUDINARY_FOLDER", "tustockya")
+ALLOWED_IMAGE_FORMATS = {"image/jpeg", "image/png", "image/webp", "image/jpg"}
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # ✅ AGREGAR ESTA LÍNEA: 10MB
+
 
 
 # Configuración de base de datos
