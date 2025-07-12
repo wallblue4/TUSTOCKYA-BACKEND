@@ -203,65 +203,221 @@ async def upload_receipt_to_cloudinary(
     record_id: str = None  # ID de venta o gasto
 ) -> str:
     """
-    Subir comprobante a Cloudinary y retornar solo la URL
+    Subir comprobante a Cloudinary - VERSIÓN CON FIX PARA FORMDATA
     """
     try:
-        # Leer y validar archivo
+        print(f"📸 [CLOUDINARY] Iniciando upload...")
+        print(f"   Archivo: {file.filename}")
+        print(f"   Content-Type: {file.content_type}")
+        print(f"   Size hint: {getattr(file, 'size', 'unknown')}")
+        print(f"   Usuario ID: {user_id}")
+        print(f"   Receipt type: {receipt_type}")
+        
+        # ✅ FIX 1: Verificar que el archivo tiene contenido
+        if not file or not file.filename:
+            raise Exception("Archivo vacío o sin nombre")
+        
+        # ✅ FIX 2: Reset file pointer antes de leer
+        await file.seek(0)
+        
+        # Leer contenido del archivo
+        print(f"📖 [CLOUDINARY] Leyendo archivo...")
         content = await file.read()
+        file_size = len(content)
         
-        if len(content) > MAX_IMAGE_SIZE:
-            raise HTTPException(status_code=413, detail="Imagen muy grande (máximo 10MB)")
+        print(f"   Tamaño leído: {file_size} bytes ({file_size/1024:.1f} KB)")
         
-        if not file.content_type or file.content_type not in ALLOWED_IMAGE_FORMATS:
-            raise HTTPException(status_code=400, detail="Formato no válido")
+        if file_size == 0:
+            raise Exception("Archivo vacío - 0 bytes leídos")
         
-        # Optimizar imagen
-        img = Image.open(io.BytesIO(content))
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
+        if file_size > MAX_IMAGE_SIZE:
+            raise Exception(f"Archivo muy grande: {file_size} bytes (máximo {MAX_IMAGE_SIZE})")
         
-        # Redimensionar si es muy grande
-        if img.width > 1920:
-            ratio = 1920 / img.width
-            new_height = int(img.height * ratio)
-            img = img.resize((1920, new_height), Image.Resampling.LANCZOS)
+        # ✅ FIX 3: Validar content-type más flexible
+        valid_types = ["image/jpeg", "image/jpg", "image/png", "image/webp"]
+        if file.content_type not in valid_types:
+            print(f"⚠️ [CLOUDINARY] Content-type '{file.content_type}' no está en lista válida")
+            print(f"   Tipos válidos: {valid_types}")
+            # Continuar pero con advertencia
         
-        # Guardar optimizada en memoria
-        output = io.BytesIO()
-        img.save(output, format='JPEG', quality=85, optimize=True)
-        optimized_content = output.getvalue()
+        print(f"✅ [CLOUDINARY] Validaciones básicas pasadas")
         
-        # Generar ID único
+        # ✅ FIX 4: Verificar que es una imagen real
+        print(f"🔍 [CLOUDINARY] Verificando formato de imagen...")
+        try:
+            # Crear copia del contenido para verificación
+            content_copy = io.BytesIO(content)
+            img_test = Image.open(content_copy)
+            img_format = img_test.format
+            img_mode = img_test.mode
+            img_size = img_test.size
+            
+            print(f"   Formato detectado: {img_format}")
+            print(f"   Modo: {img_mode}")
+            print(f"   Dimensiones: {img_size[0]}x{img_size[1]}")
+            
+            # Cerrar imagen de test
+            img_test.close()
+            content_copy.close()
+            
+        except Exception as e:
+            print(f"❌ [CLOUDINARY] No es una imagen válida: {e}")
+            raise Exception(f"Archivo no es una imagen válida: {str(e)}")
+        
+        print(f"✅ [CLOUDINARY] Imagen válida detectada")
+        
+        # Verificar configuración de Cloudinary
+        cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
+        api_key = os.getenv("CLOUDINARY_API_KEY")
+        api_secret = os.getenv("CLOUDINARY_API_SECRET")
+        
+        if not all([cloud_name, api_key, api_secret]):
+            missing = [var for var, val in [("cloud_name", cloud_name), ("api_key", api_key), ("api_secret", api_secret)] if not val]
+            raise Exception(f"Configuración incompleta de Cloudinary. Faltan: {missing}")
+        
+        # ✅ FIX 5: Configurar Cloudinary explícitamente para cada upload
+        cloudinary.config(
+            cloud_name=cloud_name,
+            api_key=api_key,
+            api_secret=api_secret,
+            secure=True
+        )
+        print(f"✅ [CLOUDINARY] Configuración aplicada")
+        
+        # ✅ FIX 6: Optimización más robusta
+        print(f"🔄 [CLOUDINARY] Optimizando imagen...")
+        try:
+            # Usar BytesIO para manejar el contenido
+            content_io = io.BytesIO(content)
+            img = Image.open(content_io)
+            
+            original_format = img.format
+            print(f"   Formato original: {original_format}")
+            print(f"   Tamaño original: {img.width}x{img.height}")
+            print(f"   Modo original: {img.mode}")
+            
+            # Convertir a RGB si es necesario
+            if img.mode in ("RGBA", "P", "LA"):
+                if img.mode == "RGBA":
+                    # Para RGBA, crear fondo blanco
+                    background = Image.new("RGB", img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
+                    img = background
+                else:
+                    img = img.convert("RGB")
+                print(f"   Convertido a RGB")
+            
+            # Redimensionar si es muy grande
+            max_dimension = 1920
+            if img.width > max_dimension or img.height > max_dimension:
+                ratio = min(max_dimension / img.width, max_dimension / img.height)
+                new_width = int(img.width * ratio)
+                new_height = int(img.height * ratio)
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                print(f"   Redimensionado a: {img.width}x{img.height}")
+            
+            # Guardar optimizada
+            output = io.BytesIO()
+            img.save(output, format='JPEG', quality=85, optimize=True)
+            optimized_content = output.getvalue()
+            
+            print(f"   Tamaño optimizado: {len(optimized_content)} bytes ({len(optimized_content)/1024:.1f} KB)")
+            print(f"   Compresión: {((len(content) - len(optimized_content)) / len(content) * 100):.1f}%")
+            
+            # Limpiar
+            img.close()
+            content_io.close()
+            output.close()
+            
+        except Exception as e:
+            print(f"⚠️ [CLOUDINARY] Error optimizando imagen: {e}")
+            print(f"   Usando imagen original...")
+            optimized_content = content
+        
+        # ✅ FIX 7: Generar nombres únicos más robustos
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
-        public_id = f"{CLOUDINARY_FOLDER}/receipts/{receipt_type}/{timestamp}_{user_id}_{unique_id}"
         
-        # Subir a Cloudinary
-        upload_result = cloudinary.uploader.upload(
-            optimized_content,
-            public_id=public_id,
-            tags=[
-                "tustockya",
-                receipt_type,
-                f"user_{user_id}",
-                f"record_{record_id}" if record_id else f"temp_{unique_id}"
-            ],
-            folder=f"{CLOUDINARY_FOLDER}/receipts/{receipt_type}",
-            resource_type="image",
-            format="jpg",
-            quality="auto:good",
-            transformation=[
+        # Obtener extensión del archivo original
+        original_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
+        safe_filename = "".join(c for c in file.filename if c.isalnum() or c in "._-")[:20] if file.filename else "upload"
+        
+        public_id = f"{CLOUDINARY_FOLDER}/receipts/{receipt_type}/{timestamp}_{user_id}_{unique_id}_{safe_filename}"
+        
+        print(f"🆔 [CLOUDINARY] Public ID: {public_id}")
+        
+        # Tags para organización
+        tags = [
+            "tustockya",
+            receipt_type,
+            f"user_{user_id}",
+            f"date_{datetime.now().strftime('%Y-%m-%d')}",
+            f"original_{original_ext[1:]}" if original_ext else "unknown_format"
+        ]
+        if record_id:
+            tags.append(f"record_{record_id}")
+        
+        print(f"🏷️ [CLOUDINARY] Tags: {tags}")
+        
+        # ✅ FIX 8: Upload con parámetros más específicos
+        print(f"☁️ [CLOUDINARY] Iniciando upload a Cloudinary...")
+        
+        upload_params = {
+            "public_id": public_id,
+            "tags": tags,
+            "folder": f"{CLOUDINARY_FOLDER}/receipts/{receipt_type}",
+            "resource_type": "image",
+            "format": "jpg",  # Forzar JPG
+            "quality": "auto:good",
+            "transformation": [
                 {"width": 1920, "height": 1920, "crop": "limit"},
                 {"quality": "auto:good"}
-            ]
+            ],
+            "use_filename": False,  # No usar nombre original
+            "unique_filename": True,  # Generar nombre único
+            "overwrite": False  # No sobrescribir si existe
+        }
+        
+        print(f"📤 [CLOUDINARY] Parámetros de upload: {upload_params}")
+        
+        upload_result = cloudinary.uploader.upload(
+            optimized_content,
+            **upload_params
         )
+        
+        print(f"✅ [CLOUDINARY] Upload exitoso!")
+        print(f"   URL: {upload_result['secure_url']}")
+        print(f"   Public ID: {upload_result['public_id']}")
+        print(f"   Tamaño final: {upload_result.get('bytes', 0)} bytes")
+        print(f"   Formato final: {upload_result.get('format', 'unknown')}")
+        print(f"   Dimensiones finales: {upload_result.get('width', 0)}x{upload_result.get('height', 0)}")
+        print(f"   Asset ID: {upload_result.get('asset_id', 'unknown')}")
         
         return upload_result["secure_url"]
         
     except CloudinaryError as e:
-        raise HTTPException(status_code=500, detail=f"Error subiendo imagen: {str(e)}")
+        print(f"❌ [CLOUDINARY] Error específico de Cloudinary:")
+        print(f"   Tipo: {type(e).__name__}")
+        print(f"   Mensaje: {str(e)}")
+        print(f"   HTTP Code: {getattr(e, 'http_code', 'unknown')}")
+        print(f"   Error Code: {getattr(e, 'error_code', 'unknown')}")
+        raise Exception(f"Error Cloudinary: {str(e)}")
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error procesando imagen: {str(e)}")
+        print(f"❌ [CLOUDINARY] Error general:")
+        print(f"   Tipo: {type(e).__name__}")
+        print(f"   Mensaje: {str(e)}")
+        
+        # Stack trace para debugging
+        try:
+            import traceback
+            print(f"   Traceback completo:")
+            traceback.print_exc()
+        except:
+            pass
+        
+        raise Exception(f"Error procesando imagen: {str(e)}")
+
 
 def validate_cloudinary_config() -> bool:
     """Verificar que Cloudinary está configurado correctamente - VERSIÓN CORREGIDA"""
@@ -2501,6 +2657,59 @@ async def mark_return_notification_read(
         "notification_id": notification_id
     }
 
+
+@app.post("/api/v1/test/cloudinary-formdata")
+async def test_cloudinary_formdata(
+    test_image: UploadFile = File(...),
+    current_user = Depends(get_current_user)
+):
+    """Test específico para FormData → Cloudinary"""
+    
+    print(f"🧪 [TEST FORMDATA] Iniciando test...")
+    print(f"   Archivo: {test_image.filename}")
+    print(f"   Content-Type: {test_image.content_type}")
+    print(f"   Size: {getattr(test_image, 'size', 'unknown')}")
+    
+    try:
+        # Reset file pointer
+        await test_image.seek(0)
+        
+        # Leer contenido
+        content = await test_image.read()
+        print(f"   Contenido leído: {len(content)} bytes")
+        
+        # Reset para la función de upload
+        await test_image.seek(0)
+        
+        # Llamar función de upload corregida
+        url = await upload_receipt_to_cloudinary(
+            test_image,
+            "test-formdata",
+            current_user['id']
+        )
+        
+        return {
+            "success": True,
+            "message": "Test FormData → Cloudinary exitoso",
+            "uploaded_url": url,
+            "file_info": {
+                "filename": test_image.filename,
+                "content_type": test_image.content_type,
+                "size_bytes": len(content)
+            }
+        }
+        
+    except Exception as e:
+        print(f"❌ [TEST FORMDATA] Error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "type": type(e).__name__,
+            "file_info": {
+                "filename": test_image.filename,
+                "content_type": test_image.content_type
+            }
+        }
 
 @app.get("/api/v1/cloudinary/status")
 async def cloudinary_status():
