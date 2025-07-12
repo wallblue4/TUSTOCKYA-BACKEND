@@ -8,7 +8,7 @@ import asyncio
 import httpx
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, status, File, UploadFile, Depends
+from fastapi import FastAPI, HTTPException, status, File, UploadFile, Depends , Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -21,6 +21,9 @@ import cloudinary.utils
 from cloudinary.exceptions import Error as CloudinaryError
 import io
 from PIL import Image
+from typing import Optional
+import json
+
 
 # ==================== CONFIGURACIÓN PARA RAILWAY ====================
 
@@ -288,6 +291,41 @@ def validate_cloudinary_config() -> bool:
         print(f"❌ Error conectando a Cloudinary: {e}")
         return False
 
+def get_sale_items(sale_id: int) -> list:
+    """Obtener items de una venta específica (función auxiliar)"""
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute(
+            'SELECT * FROM sale_items WHERE sale_id = %s',
+            (sale_id,)
+        )
+        items = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute(
+            'SELECT * FROM sale_items WHERE sale_id = ?',
+            (sale_id,)
+        )
+        items = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    # Convertir al formato esperado por update_stock_after_sale
+    formatted_items = []
+    for item in items:
+        formatted_items.append({
+            'sneaker_reference_code': item['sneaker_reference_code'],
+            'size': item['size'],
+            'quantity': item['quantity']
+        })
+    
+    return formatted_items
 
 # ==================== CONFIGURACIÓN FASTAPI ====================
 
@@ -1162,59 +1200,199 @@ async def get_locations(current_user = Depends(get_current_user)):
 # VENTAS COMPLETAS CON MÉTODOS DE PAGO
 @app.post("/api/v1/sales/create")
 async def create_sale_complete(
-    # Datos del formulario
-    items: str,  # JSON string de items
-    total_amount: float,
-    payment_methods: str,  # JSON string de métodos de pago
-    notes: str = "",
-    requires_confirmation: bool = False,
-    # Archivo de imagen (opcional)
-    receipt_image: UploadFile = File(None),
+    # Datos como Form fields - TODOS los parámetros con Form(...)
+    items: str = Form(..., description="JSON string con array de items de la venta"),
+    total_amount: float = Form(..., description="Monto total de la venta", gt=0),
+    payment_methods: str = Form(..., description="JSON string con métodos de pago"),
+    notes: str = Form("", description="Notas adicionales sobre la venta"),
+    requires_confirmation: bool = Form(False, description="Si la venta requiere confirmación posterior"),
+    # Archivo opcional
+    receipt_image: Optional[UploadFile] = File(None, description="Imagen del comprobante de venta"),
     current_user = Depends(get_current_user)
 ):
-    """Registrar venta completa - CON IMAGEN EN EL MISMO ENDPOINT"""
+    """
+    Registrar venta completa con comprobante opcional
     
+    **Parámetros:**
+    - **items**: JSON string con items de la venta
+    - **total_amount**: Monto total de la venta (debe ser > 0)
+    - **payment_methods**: JSON string con métodos de pago
+    - **notes**: Notas adicionales (opcional)
+    - **requires_confirmation**: Si requiere confirmación posterior (default: false)
+    - **receipt_image**: Archivo de imagen del comprobante (opcional)
+    
+    **Ejemplo de items JSON:**
+    ```json
+    [
+        {
+            "sneaker_reference_code": "NK-AF1-001",
+            "brand": "Nike",
+            "model": "Air Force 1",
+            "color": "Blanco",
+            "size": "9.0",
+            "quantity": 1,
+            "unit_price": 150.00
+        }
+    ]
+    ```
+    
+    **Ejemplo de payment_methods JSON:**
+    ```json
+    [
+        {
+            "type": "efectivo",
+            "amount": 100.00,
+            "reference": null
+        },
+        {
+            "type": "tarjeta",
+            "amount": 50.00,
+            "reference": "****1234"
+        }
+    ]
+    ```
+    """
+    
+    print(f"📥 [SALE] Iniciando registro de venta")
+    print(f"   Usuario: {current_user['email']} (ID: {current_user['id']})")
+    print(f"   Location: {current_user['location_id']}")
+    print(f"   Total: ${total_amount}")
+    print(f"   Requiere confirmación: {requires_confirmation}")
+    print(f"   Imagen: {'Sí (' + receipt_image.filename + ')' if receipt_image and receipt_image.filename else 'No'}")
+    
+    # Verificar permisos
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden registrar ventas")
     
+    # Validar monto total
+    if total_amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto total debe ser mayor a 0")
+    
     try:
         # Parsear datos JSON
-        import json
+        print(f"📦 [JSON] Parseando items: {items[:200]}..." if len(items) > 200 else f"📦 [JSON] Items: {items}")
         items_data = json.loads(items)
+        
+        print(f"💳 [JSON] Parseando payment methods: {payment_methods[:200]}..." if len(payment_methods) > 200 else f"💳 [JSON] Payment methods: {payment_methods}")
         payment_methods_data = json.loads(payment_methods)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Datos JSON inválidos")
+        
+        print(f"✅ [JSON] Parseado exitoso:")
+        print(f"   Items: {len(items_data)} productos")
+        print(f"   Métodos de pago: {len(payment_methods_data)} métodos")
+        
+    except json.JSONDecodeError as e:
+        print(f"❌ [JSON] Error parseando JSON: {e}")
+        raise HTTPException(status_code=400, detail=f"Datos JSON inválidos: {str(e)}")
+    except Exception as e:
+        print(f"❌ [JSON] Error inesperado parseando: {e}")
+        raise HTTPException(status_code=400, detail=f"Error procesando datos: {str(e)}")
+    
+    # Validar estructura de items
+    try:
+        for i, item in enumerate(items_data):
+            required_fields = ['sneaker_reference_code', 'brand', 'model', 'size', 'quantity', 'unit_price']
+            for field in required_fields:
+                if field not in item:
+                    raise HTTPException(status_code=400, detail=f"Item {i+1}: falta campo '{field}'")
+            
+            if item['quantity'] <= 0:
+                raise HTTPException(status_code=400, detail=f"Item {i+1}: quantity debe ser mayor a 0")
+            
+            if item['unit_price'] <= 0:
+                raise HTTPException(status_code=400, detail=f"Item {i+1}: unit_price debe ser mayor a 0")
+        
+        print(f"✅ [VALIDATION] Items validados correctamente")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error validando items: {str(e)}")
+    
+    # Validar estructura de métodos de pago
+    try:
+        for i, payment in enumerate(payment_methods_data):
+            required_fields = ['type', 'amount']
+            for field in required_fields:
+                if field not in payment:
+                    raise HTTPException(status_code=400, detail=f"Método de pago {i+1}: falta campo '{field}'")
+            
+            if payment['amount'] <= 0:
+                raise HTTPException(status_code=400, detail=f"Método de pago {i+1}: amount debe ser mayor a 0")
+        
+        print(f"✅ [VALIDATION] Métodos de pago validados correctamente")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error validando métodos de pago: {str(e)}")
     
     # Validar que los métodos de pago sumen el total
-    total_payments = sum(payment['amount'] for payment in payment_methods_data)
-    if abs(total_payments - total_amount) > 0.01:
+    total_payments = sum(float(payment['amount']) for payment in payment_methods_data)
+    if abs(total_payments - total_amount) > 0.01:  # Tolerancia de 1 centavo
+        print(f"❌ [VALIDATION] Métodos de pago no coinciden:")
+        print(f"   Total esperado: ${total_amount}")
+        print(f"   Total métodos de pago: ${total_payments}")
         raise HTTPException(
             status_code=400, 
             detail=f"Los métodos de pago (${total_payments:.2f}) no coinciden con el total (${total_amount:.2f})"
         )
     
+    print(f"✅ [VALIDATION] Totales coinciden: ${total_amount}")
+    
+    # Validar stock disponible (opcional, descomenta si quieres validar stock)
+    """
+    try:
+        stock_issues = validate_stock_availability(items_data, current_user['location_id'])
+        if stock_issues:
+            print(f"❌ [STOCK] Issues encontrados: {stock_issues}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Stock insuficiente: {stock_issues}"
+            )
+        print(f"✅ [STOCK] Stock disponible para todos los items")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"⚠️ [STOCK] Error validando stock: {e}")
+        # Continuar sin validación de stock si hay error
+    """
+    
     # Subir imagen a Cloudinary si existe
     receipt_url = None
     if receipt_image and receipt_image.filename:
-        print(f"📸 Subiendo comprobante de venta...")
-        receipt_url = await upload_receipt_to_cloudinary(
-            receipt_image, 
-            "sale", 
-            current_user['id']
-        )
-        print(f"✅ Comprobante subido: {receipt_url}")
+        try:
+            print(f"📸 [CLOUDINARY] Subiendo comprobante de venta...")
+            print(f"   Archivo: {receipt_image.filename}")
+            print(f"   Tipo: {receipt_image.content_type}")
+            
+            receipt_url = await upload_receipt_to_cloudinary(
+                receipt_image, 
+                "sale", 
+                current_user['id']
+            )
+            print(f"✅ [CLOUDINARY] Comprobante subido exitosamente:")
+            print(f"   URL: {receipt_url}")
+            
+        except Exception as e:
+            print(f"❌ [CLOUDINARY] Error subiendo imagen: {e}")
+            # Continuar sin imagen si falla el upload - la venta no debe fallar por esto
+            receipt_url = None
     
-    # Guardar en base de datos
+    # Conectar a base de datos
     if USE_POSTGRESQL:
         import psycopg2
         conn = psycopg2.connect(DB_PATH)
         cursor = conn.cursor()
+        print(f"🔗 [DATABASE] Conectado a PostgreSQL")
     else:
         conn = sqlite3.connect(DB_PATH)
+        print(f"🔗 [DATABASE] Conectado a SQLite")
     
     try:
         sale_timestamp = datetime.now().isoformat()
+        print(f"🕐 [TIMESTAMP] {sale_timestamp}")
         
+        # Crear la venta principal
         if USE_POSTGRESQL:
             cursor.execute(
                 '''INSERT INTO sales (seller_id, location_id, total_amount, receipt_image, notes, 
@@ -1222,7 +1400,7 @@ async def create_sale_complete(
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
                 (current_user['id'], current_user['location_id'], total_amount, 
                  receipt_url, notes, requires_confirmation,
-                 not requires_confirmation,
+                 not requires_confirmation,  # Si no requiere confirmación, ya está confirmada
                  None if requires_confirmation else sale_timestamp,
                  sale_timestamp)
             )
@@ -1240,8 +1418,10 @@ async def create_sale_complete(
             )
             sale_id = cursor.lastrowid
         
+        print(f"✅ [DATABASE] Venta creada con ID: {sale_id}")
+        
         # Crear los métodos de pago
-        for payment in payment_methods_data:
+        for i, payment in enumerate(payment_methods_data):
             if USE_POSTGRESQL:
                 cursor.execute(
                     '''INSERT INTO sale_payments (sale_id, payment_type, amount, reference)
@@ -1254,10 +1434,15 @@ async def create_sale_complete(
                        VALUES (?, ?, ?, ?)''',
                     (sale_id, payment['type'], payment['amount'], payment.get('reference'))
                 )
+            
+            print(f"✅ [DATABASE] Método de pago {i+1}: {payment['type']} ${payment['amount']}")
         
         # Crear los items de la venta
-        for item in items_data:
-            subtotal = item['quantity'] * item['unit_price']
+        total_items_value = 0
+        for i, item in enumerate(items_data):
+            subtotal = float(item['quantity']) * float(item['unit_price'])
+            total_items_value += subtotal
+            
             if USE_POSTGRESQL:
                 cursor.execute(
                     '''INSERT INTO sale_items (sale_id, sneaker_reference_code, brand, model, color, 
@@ -1274,37 +1459,95 @@ async def create_sale_complete(
                     (sale_id, item['sneaker_reference_code'], item['brand'], item['model'], 
                      item.get('color'), item['size'], item['quantity'], item['unit_price'], subtotal)
                 )
+            
+            print(f"✅ [DATABASE] Item {i+1}: {item['brand']} {item['model']} - {item['quantity']}x${item['unit_price']} = ${subtotal}")
         
+        print(f"✅ [DATABASE] Total items calculado: ${total_items_value}")
+        
+        # Commit de la transacción
         conn.commit()
+        print(f"✅ [DATABASE] Transacción completada exitosamente")
         
         # Actualizar stock si no requiere confirmación
         if not requires_confirmation:
             try:
+                print(f"📦 [STOCK] Actualizando stock...")
                 update_stock_after_sale(items_data, current_user['location_id'])
+                print(f"✅ [STOCK] Stock actualizado correctamente")
             except Exception as e:
-                print(f"⚠️ Error actualizando stock: {e}")
+                print(f"⚠️ [STOCK] Error actualizando stock: {e}")
+                # No fallar la venta por error de stock
+        else:
+            print(f"⏳ [STOCK] Actualización de stock pendiente de confirmación")
         
-        return {
+        # Preparar respuesta
+        response_data = {
             "success": True,
             "sale_id": sale_id,
             "message": "Venta registrada exitosamente",
             "sale_timestamp": sale_timestamp,
-            "total_amount": total_amount,
-            "items_count": len(items_data),
-            "payment_methods_count": len(payment_methods_data),
+            "sale_details": {
+                "total_amount": total_amount,
+                "items_count": len(items_data),
+                "payment_methods_count": len(payment_methods_data),
+                "total_items_value": total_items_value
+            },
+            "payment_breakdown": [
+                {
+                    "type": p['type'], 
+                    "amount": p['amount'], 
+                    "reference": p.get('reference')
+                } for p in payment_methods_data
+            ],
+            "items_summary": [
+                {
+                    "reference": item['sneaker_reference_code'],
+                    "brand": item['brand'],
+                    "model": item['model'],
+                    "size": item['size'],
+                    "quantity": item['quantity'],
+                    "unit_price": item['unit_price'],
+                    "subtotal": item['quantity'] * item['unit_price']
+                } for item in items_data
+            ],
             "receipt_info": {
                 "has_receipt": bool(receipt_url),
                 "receipt_url": receipt_url,
                 "stored_in": "Cloudinary CDN" if receipt_url else None
             },
-            "status": "pending_confirmation" if requires_confirmation else "confirmed"
+            "status_info": {
+                "status": "pending_confirmation" if requires_confirmation else "confirmed",
+                "requires_confirmation": requires_confirmation,
+                "confirmed": not requires_confirmation,
+                "confirmed_at": None if requires_confirmation else sale_timestamp
+            },
+            "seller_info": {
+                "seller_id": current_user['id'],
+                "seller_name": f"{current_user['first_name']} {current_user['last_name']}",
+                "seller_email": current_user['email'],
+                "location_id": current_user['location_id']
+            }
         }
         
+        print(f"🎉 [SUCCESS] Venta {sale_id} registrada exitosamente")
+        print(f"   Total: ${total_amount}")
+        print(f"   Items: {len(items_data)}")
+        print(f"   Métodos de pago: {len(payment_methods_data)}")
+        print(f"   Estado: {'Pendiente confirmación' if requires_confirmation else 'Confirmada'}")
+        
+        return response_data
+        
     except Exception as e:
+        # Rollback en caso de error
         conn.rollback()
+        print(f"❌ [DATABASE] Error en transacción: {e}")
+        print(f"❌ [DATABASE] Rollback ejecutado")
         raise HTTPException(status_code=500, detail=f"Error registrando venta: {str(e)}")
+        
     finally:
+        # Cerrar conexión
         conn.close()
+        print(f"🔐 [DATABASE] Conexión cerrada")
 
 @app.post("/api/v1/sales/confirm")
 async def confirm_sale(
@@ -1565,16 +1808,30 @@ async def get_pending_confirmation_sales(current_user = Depends(get_current_user
 
 # GASTOS
 @app.post("/api/v1/expenses/create")
-async def create_expense(
-    # Datos del formulario
-    concept: str,
-    amount: float,
-    notes: str = "",
-    # Archivo de imagen (opcional)
-    receipt_image: UploadFile = File(None),
+async def create_expense_corrected(
+    # ✅ IMPORTANTE: Usar Form(...) para cada parámetro
+    concept: str = Form(..., description="Concepto del gasto"),
+    amount: float = Form(..., description="Monto del gasto", gt=0),
+    notes: str = Form("", description="Notas adicionales"),
+    # ✅ File(None) para archivos opcionales
+    receipt_image: Optional[UploadFile] = File(None, description="Imagen del comprobante"),
     current_user = Depends(get_current_user)
 ):
-    """Registrar gasto - CON IMAGEN EN EL MISMO ENDPOINT"""
+    """
+    Registrar gasto con comprobante opcional
+    
+    - **concept**: Concepto del gasto (requerido)
+    - **amount**: Monto del gasto (requerido, mayor a 0)
+    - **notes**: Notas adicionales (opcional)
+    - **receipt_image**: Archivo de imagen del comprobante (opcional)
+    """
+    
+    print(f"📥 [EXPENSE] Datos recibidos:")
+    print(f"   Concepto: {concept}")
+    print(f"   Monto: {amount}")
+    print(f"   Notas: {notes}")
+    print(f"   Usuario: {current_user['email']}")
+    print(f"   Imagen: {'Sí (' + receipt_image.filename + ')' if receipt_image and receipt_image.filename else 'No'}")
     
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden registrar gastos")
@@ -1585,13 +1842,18 @@ async def create_expense(
     # Subir imagen a Cloudinary si existe
     receipt_url = None
     if receipt_image and receipt_image.filename:
-        print(f"📸 Subiendo comprobante de gasto...")
-        receipt_url = await upload_receipt_to_cloudinary(
-            receipt_image, 
-            "expense", 
-            current_user['id']
-        )
-        print(f"✅ Comprobante subido: {receipt_url}")
+        try:
+            print(f"📸 [CLOUDINARY] Subiendo comprobante de gasto...")
+            receipt_url = await upload_receipt_to_cloudinary(
+                receipt_image, 
+                "expense", 
+                current_user['id']
+            )
+            print(f"✅ [CLOUDINARY] Comprobante subido: {receipt_url}")
+        except Exception as e:
+            print(f"❌ [CLOUDINARY] Error subiendo imagen: {e}")
+            # Continuar sin imagen si falla el upload
+            receipt_url = None
     
     # Guardar en base de datos
     if USE_POSTGRESQL:
@@ -1622,6 +1884,7 @@ async def create_expense(
             expense_id = cursor.lastrowid
         
         conn.commit()
+        print(f"✅ [DATABASE] Gasto registrado: ID {expense_id}")
         
         return {
             "success": True,
@@ -1641,6 +1904,7 @@ async def create_expense(
         
     except Exception as e:
         conn.rollback()
+        print(f"❌ [DATABASE] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Error registrando gasto: {str(e)}")
     finally:
         conn.close()
