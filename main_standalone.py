@@ -2748,6 +2748,40 @@ def test_cloudinary_manually():
         return False
 
 
+# Test manual de Cloudinary
+@app.get("/api/v1/debug/cloudinary-manual")
+async def debug_cloudinary_manual():
+    try:
+        # Crear imagen de prueba simple
+        from PIL import Image
+        import io
+        
+        # Crear imagen 100x100 blanca
+        img = Image.new('RGB', (100, 100), color='white')
+        output = io.BytesIO()
+        img.save(output, format='JPEG')
+        image_data = output.getvalue()
+        
+        # Intentar subir
+        result = cloudinary.uploader.upload(
+            image_data,
+            public_id=f"test_manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            folder="tustockya/test"
+        )
+        
+        return {
+            "success": True,
+            "result": result,
+            "url": result["secure_url"]
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "type": type(e).__name__
+        }
+
 
 # ==================== INICIALIZACIÓN DE BD ====================
 
