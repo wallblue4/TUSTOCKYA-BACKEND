@@ -2195,56 +2195,83 @@ async def create_transfer_request_complete(
     """Solicitar tenis de otro local según requerimientos (siguiendo el flujo del escaneo)"""
     
     if current_user['role'] not in ['seller', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo selleres pueden solicitar transferencias")
+        raise HTTPException(status_code=403, detail="Solo sellers pueden solicitar transferencias")
     
-    if USE_POSTGRESQL:
-        import psycopg2
-        import psycopg2.extras
-        conn = psycopg2.connect(DB_PATH)
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    else:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-    
-    request_timestamp = datetime.now().isoformat()
-    
-    if USE_POSTGRESQL:
-        cursor.execute(
-            '''INSERT INTO transfer_requests
-            (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
-                brand, model, size, quantity, purpose, pickup_type, destination_type, notes, requested_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
-            (current_user['id'], transfer_data.source_location_id, current_user['location_id'],
-            transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
-            transfer_data.size, transfer_data.quantity, transfer_data.purpose,
-            transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, request_timestamp)
-        )
-        returned_row = cursor.fetchone() # Obtén la fila
-        print(f"DEBUG: Fila devuelta por INSERT: {returned_row}") # Agrega esta línea para depuración
-        if returned_row is None:
-            raise Exception("No se pudo obtener el ID después de INSERT para PostgreSQL.") # O maneja de forma más elegante
-        request_id = returned_row['id']  # Accede al elemento
+    conn = None # Inicializa conn a None
+    cursor = None # Inicializa cursor a None
+    request_id = None # Inicializa request_id a None
+    source_location = None # ¡Importante! Inicializa source_location aquí
 
-    else:
-        cursor = conn.execute(
-            '''INSERT INTO transfer_requests 
-               (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
-                brand, model, size, quantity, purpose, pickup_type, destination_type, notes, requested_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (current_user['id'], transfer_data.source_location_id, current_user['location_id'],
-             transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
-             transfer_data.size, transfer_data.quantity, transfer_data.purpose,
-             transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, request_timestamp)
-        )
-        request_id = cursor.lastrowid
+    try:
+        if USE_POSTGRESQL:
+            # Asegúrate de que psycopg2 y psycopg2.extras estén importados al inicio del archivo
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            cursor.execute(
+                '''INSERT INTO transfer_requests
+                (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
+                    brand, model, size, quantity, purpose, pickup_type, destination_type, notes, requested_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+                (current_user['id'], transfer_data.source_location_id, current_user['location_id'],
+                transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
+                transfer_data.size, transfer_data.quantity, transfer_data.purpose,
+                transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, datetime.now().isoformat())
+            )
+            returned_row = cursor.fetchone() 
+            print(f"DEBUG: Fila devuelta por INSERT: {returned_row}") 
+            
+            if returned_row is None:
+                raise HTTPException(status_code=500, detail="Error: No se pudo obtener el ID después de la inserción de PostgreSQL.")
+            
+            # Accede al ID usando la clave 'id' del diccionario
+            request_id = returned_row['id']  
+
+            # Obtener nombre de la ubicación origen
+            cursor.execute('SELECT name FROM locations WHERE id = %s', (transfer_data.source_location_id,))
+            source_location = cursor.fetchone() # Esto también devuelve un RealDictRow si se encuentra
+            
+        else: # Uso de SQLite
+            # Asegúrate de que sqlite3 esté importado al inicio del archivo
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row # Para acceder a las columnas por nombre
+            
+            cursor = conn.execute(
+                '''INSERT INTO transfer_requests 
+                (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
+                    brand, model, size, quantity, purpose, pickup_type, destination_type, notes, requested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (current_user['id'], transfer_data.source_location_id, current_user['location_id'],
+                transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
+                transfer_data.size, transfer_data.quantity, transfer_data.purpose,
+                transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, datetime.now().isoformat())
+            )
+            request_id = cursor.lastrowid
+            
+            # Obtener nombre de la ubicación origen
+            cursor = conn.execute('SELECT name FROM locations WHERE id = ?', (transfer_data.source_location_id,))
+            source_location = cursor.fetchone() # Esto devolverá una sqlite3.Row si se encuentra
         
-        # Obtener nombre de la ubicación origen
-        cursor = conn.execute('SELECT name FROM locations WHERE id = ?', (transfer_data.source_location_id,))
-        source_location = cursor.fetchone()
+        conn.commit() # Confirma los cambios en la base de datos
+
+    except (psycopg2.Error, sqlite3.Error) as e:
+        # Captura errores específicos de base de datos para ambos tipos
+        if conn:
+            conn.rollback() # Revierte la transacción en caso de error
+        raise HTTPException(status_code=500, detail=f"Error de base de datos: {str(e)}")
+    except Exception as e:
+        # Captura cualquier otro error inesperado
+        if conn:
+            conn.rollback() # Revierte la transacción
+        raise HTTPException(status_code=500, detail=f"Ocurrió un error inesperado en el servicio: {str(e)}")
+    finally:
+        # Este bloque se ejecuta siempre, asegurando que la conexión se cierre
+        if conn:
+            conn.close()
     
-    conn.commit()
-    conn.close()
-    
+    # Asegúrate de usar la request_timestamp generada al inicio
+    request_timestamp = datetime.now().isoformat()
+
     return {
         "success": True,
         "transfer_request_id": request_id,
@@ -2258,7 +2285,12 @@ async def create_transfer_request_complete(
                 "size": transfer_data.size,
                 "quantity": transfer_data.quantity
             },
-            "source_location": source_location[0] if source_location else f"Local #{transfer_data.source_location_id}",
+            # Manejo unificado para source_location
+            "source_location": (
+                source_location['name'] if USE_POSTGRESQL and source_location and 'name' in source_location else
+                source_location['name'] if not USE_POSTGRESQL and source_location and 'name' in source_location else
+                f"Local #{transfer_data.source_location_id}"
+            ),
             "destination_location": f"Local #{current_user['location_id']}",
             "purpose": "Para exhibición" if transfer_data.purpose == "exhibition" else "Para venta",
             "pickup_arrangement": {
