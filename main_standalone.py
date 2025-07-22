@@ -2223,7 +2223,7 @@ async def create_transfer_request_complete(
         print(f"DEBUG: Fila devuelta por INSERT: {returned_row}") # Agrega esta línea para depuración
         if returned_row is None:
             raise Exception("No se pudo obtener el ID después de INSERT para PostgreSQL.") # O maneja de forma más elegante
-        request_id = returned_row[0] # Accede al elemento
+        request_id = returned_row['id']  # Accede al elemento
 
     else:
         cursor = conn.execute(
