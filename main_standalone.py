@@ -2210,20 +2210,21 @@ async def create_transfer_request_complete(
     
     if USE_POSTGRESQL:
         cursor.execute(
-            '''INSERT INTO transfer_requests 
-               (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
+            '''INSERT INTO transfer_requests
+            (requester_id, source_location_id, destination_location_id, sneaker_reference_code,
                 brand, model, size, quantity, purpose, pickup_type, destination_type, notes, requested_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id''',
             (current_user['id'], transfer_data.source_location_id, current_user['location_id'],
-             transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
-             transfer_data.size, transfer_data.quantity, transfer_data.purpose,
-             transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, request_timestamp)
+            transfer_data.sneaker_reference_code, transfer_data.brand, transfer_data.model,
+            transfer_data.size, transfer_data.quantity, transfer_data.purpose,
+            transfer_data.pickup_type, transfer_data.destination_type, transfer_data.notes, request_timestamp)
         )
-        request_id = cursor.fetchone()[0]
-        
-        # Obtener nombre de la ubicación origen
-        cursor.execute('SELECT name FROM locations WHERE id = %s', (transfer_data.source_location_id,))
-        source_location = cursor.fetchone()
+        returned_row = cursor.fetchone() # Obtén la fila
+        print(f"DEBUG: Fila devuelta por INSERT: {returned_row}") # Agrega esta línea para depuración
+        if returned_row is None:
+            raise Exception("No se pudo obtener el ID después de INSERT para PostgreSQL.") # O maneja de forma más elegante
+        request_id = returned_row[0] # Accede al elemento
+
     else:
         cursor = conn.execute(
             '''INSERT INTO transfer_requests 
