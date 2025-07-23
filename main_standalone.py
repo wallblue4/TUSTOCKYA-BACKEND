@@ -3439,15 +3439,17 @@ async def get_courier_delivery_history(current_user = Depends(get_current_user))
 
 # ==================== ENDPOINTS ADICIONALES PARA VENDEDOR ====================
 
+# ==================== FIX PARA KeyError EN fetchone ====================
+
 @app.post("/api/v1/vendor/confirm-reception/{request_id}")
-async def confirm_product_reception_description_fixed(
+async def confirm_product_reception_fetchone_fixed(
     request_id: int,
     received_quantity: int = 1,
     condition_ok: bool = True,
     notes: str = "",
     current_user = Depends(get_current_user)
 ):
-    """VE008: Confirmar recepción - FIX description NULL"""
+    """VE008: Confirmar recepción - FIX fetchone KeyError"""
     
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden confirmar recepción")
@@ -3562,73 +3564,103 @@ async def confirm_product_reception_description_fixed(
                     source_product = cursor.fetchone()
                     
                     if source_product:
-                        # ✅ FIX: Incluir description, created_at, updated_at y otros campos requeridos
-                        cursor.execute('''
-                            INSERT INTO products (
-                                reference_code, brand, model, description, color_info, 
-                                location_name, unit_price, box_price, is_active,
-                                video_url, image_url, created_at, updated_at
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            RETURNING id
-                        ''', (
-                            source_product['reference_code'],
-                            source_product['brand'], 
-                            source_product['model'],
-                            source_product['description'] or f"{source_product['brand']} {source_product['model']}", # ✅ FIX: description
-                            source_product['color_info'] or "Varios",
-                            vendor_location_name,
-                            source_product['unit_price'] or 0.0,
-                            source_product['box_price'] or 0.0,
-                            1,  # is_active = 1
-                            source_product['video_url'],  # Puede ser NULL
-                            source_product['image_url'],   # Puede ser NULL
-                            timestamp,  # ✅ FIX: created_at timestamp
-                            timestamp   # ✅ FIX: updated_at timestamp
-                        ))
-                        
-                        new_product_id = cursor.fetchone()[0]
+                        # ✅ FIX: Manejo seguro del INSERT con RETURNING
+                        try:
+                            cursor.execute('''
+                                INSERT INTO products (
+                                    reference_code, brand, model, description, color_info, 
+                                    location_name, unit_price, box_price, is_active,
+                                    video_url, image_url, created_at, updated_at
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                RETURNING id
+                            ''', (
+                                source_product['reference_code'],
+                                source_product['brand'], 
+                                source_product['model'],
+                                source_product['description'] or f"{source_product['brand']} {source_product['model']}",
+                                source_product['color_info'] or "Varios",
+                                vendor_location_name,
+                                float(source_product['unit_price']) if source_product['unit_price'] else 0.0,
+                                float(source_product['box_price']) if source_product['box_price'] else 0.0,
+                                1,
+                                source_product['video_url'],
+                                source_product['image_url'],
+                                timestamp,
+                                timestamp
+                            ))
+                            
+                            # ✅ FIX: Manejo seguro del resultado
+                            result = cursor.fetchone()
+                            if result and 'id' in result:
+                                new_product_id = result['id']
+                            elif result:
+                                # Si result es una tupla o lista
+                                new_product_id = result[0] if hasattr(result, '__getitem__') else None
+                            else:
+                                raise Exception("No se pudo obtener ID del producto creado")
+                            
+                            if not new_product_id:
+                                raise Exception("ID del producto nuevo es None")
+                            
+                        except Exception as insert_error:
+                            raise Exception(f"Error en INSERT de producto: {str(insert_error)}")
                         
                         # Crear stock para el nuevo producto
-                        cursor.execute('''
-                            INSERT INTO product_sizes (
-                                product_id, size, quantity, quantity_exhibition, location_name
-                            ) VALUES (%s, %s, %s, %s, %s)
-                        ''', (
-                            new_product_id, 
-                            request['size'], 
-                            received_quantity, 
-                            0,
-                            vendor_location_name
-                        ))
-                        action_taken = "created_new_product_and_stock"
+                        try:
+                            cursor.execute('''
+                                INSERT INTO product_sizes (
+                                    product_id, size, quantity, quantity_exhibition, location_name
+                                ) VALUES (%s, %s, %s, %s, %s)
+                            ''', (
+                                new_product_id, 
+                                request['size'], 
+                                received_quantity, 
+                                0,
+                                vendor_location_name
+                            ))
+                            action_taken = "created_new_product_and_stock"
+                            
+                        except Exception as size_error:
+                            raise Exception(f"Error en INSERT de product_sizes: {str(size_error)}")
                     
                     else:
                         # Producto no existe en ningún lugar - crear desde datos de transferencia
-                        # ✅ FIX: Generar description completa
                         product_description = f"{request['brand']} {request['model']}"
                         
-                        cursor.execute('''
-                            INSERT INTO products (
-                                reference_code, brand, model, description, color_info,
-                                location_name, unit_price, box_price, is_active, created_at
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            RETURNING id
-                        ''', (
-                            request['sneaker_reference_code'],
-                            request['brand'],
-                            request['model'],
-                            product_description,  # ✅ FIX: description completa
-                            "Color estándar",     # ✅ FIX: color_info por defecto
-                            vendor_location_name,
-                            180.0,  # Precio por defecto
-                            162.0,  # Box price por defecto
-                            1,      # is_active = 1
-                            timestamp  # ✅ FIX: created_at timestamp
-                        ))
+                        try:
+                            cursor.execute('''
+                                INSERT INTO products (
+                                    reference_code, brand, model, description, color_info,
+                                    location_name, unit_price, box_price, is_active, created_at, updated_at
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                RETURNING id
+                            ''', (
+                                request['sneaker_reference_code'],
+                                request['brand'],
+                                request['model'],
+                                product_description,
+                                "Color estándar",
+                                vendor_location_name,
+                                180.0,
+                                162.0,
+                                1,
+                                timestamp,
+                                timestamp
+                            ))
+                            
+                            # ✅ FIX: Manejo seguro del resultado
+                            result = cursor.fetchone()
+                            if result and 'id' in result:
+                                new_product_id = result['id']
+                            elif result:
+                                new_product_id = result[0] if hasattr(result, '__getitem__') else None
+                            else:
+                                raise Exception("No se pudo obtener ID del producto creado desde transfer")
+                                
+                        except Exception as transfer_insert_error:
+                            raise Exception(f"Error en INSERT desde transfer: {str(transfer_insert_error)}")
                         
-                        new_product_id = cursor.fetchone()[0]
-                        
-                        # Crear stock para el nuevo producto
+                        # Crear stock
                         cursor.execute('''
                             INSERT INTO product_sizes (
                                 product_id, size, quantity, quantity_exhibition, location_name
@@ -3643,7 +3675,7 @@ async def confirm_product_reception_description_fixed(
                         action_taken = "created_product_from_transfer_data"
                 
             else:
-                # LÓGICA SIMILAR PARA SQLite
+                # LÓGICA SIMILAR PARA SQLite (más simple, no usa RETURNING)
                 cursor = conn.execute('''
                     SELECT p.id, p.reference_code, p.location_name
                     FROM products p 
@@ -3683,7 +3715,7 @@ async def confirm_product_reception_description_fixed(
                         ))
                         action_taken = "added_new_size_to_existing_product"
                 else:
-                    # Crear nuevo producto
+                    # Crear nuevo producto (SQLite usa lastrowid)
                     cursor = conn.execute('''
                         SELECT reference_code, brand, model, description, color_info, unit_price, box_price
                         FROM products 
@@ -3694,12 +3726,11 @@ async def confirm_product_reception_description_fixed(
                     source_product = cursor.fetchone()
                     
                     if source_product:
-                        # ✅ FIX: Incluir description y created_at para SQLite
                         cursor = conn.execute('''
                             INSERT INTO products (
                                 reference_code, brand, model, description, color_info, 
-                                location_name, unit_price, box_price, is_active, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                location_name, unit_price, box_price, is_active, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             source_product['reference_code'],
                             source_product['brand'], 
@@ -3707,15 +3738,15 @@ async def confirm_product_reception_description_fixed(
                             source_product['description'] or f"{source_product['brand']} {source_product['model']}",
                             source_product['color_info'] or "Varios",
                             vendor_location_name,
-                            source_product['unit_price'] or 0.0,
-                            source_product['box_price'] or 0.0,
+                            float(source_product['unit_price']) if source_product['unit_price'] else 0.0,
+                            float(source_product['box_price']) if source_product['box_price'] else 0.0,
                             1,
-                            timestamp  # ✅ FIX: created_at timestamp
+                            timestamp,
+                            timestamp
                         ))
                         
-                        new_product_id = cursor.lastrowid
+                        new_product_id = cursor.lastrowid  # ✅ SQLite usa lastrowid
                         
-                        # Crear stock
                         conn.execute('''
                             INSERT INTO product_sizes (
                                 product_id, size, quantity, quantity_exhibition, location_name
@@ -3728,42 +3759,6 @@ async def confirm_product_reception_description_fixed(
                             vendor_location_name
                         ))
                         action_taken = "created_new_product_and_stock"
-                    else:
-                        # ✅ FIX: Crear desde transferencia con description
-                        product_description = f"{request['brand']} {request['model']}"
-                        
-                        cursor = conn.execute('''
-                            INSERT INTO products (
-                                reference_code, brand, model, description, color_info,
-                                location_name, unit_price, box_price, is_active, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            request['sneaker_reference_code'],
-                            request['brand'],
-                            request['model'],
-                            product_description,
-                            "Color estándar",
-                            vendor_location_name,
-                            180.0,
-                            162.0,
-                            1,
-                            timestamp  # ✅ FIX: created_at timestamp
-                        ))
-                        
-                        new_product_id = cursor.lastrowid
-                        
-                        conn.execute('''
-                            INSERT INTO product_sizes (
-                                product_id, size, quantity, quantity_exhibition, location_name
-                            ) VALUES (?, ?, ?, ?, ?)
-                        ''', (
-                            new_product_id, 
-                            request['size'], 
-                            received_quantity, 
-                            0,
-                            vendor_location_name
-                        ))
-                        action_taken = "created_product_from_transfer_data"
             
             # PASO 3: Actualizar estado de transferencia
             if USE_POSTGRESQL:
@@ -3799,10 +3794,7 @@ async def confirm_product_reception_description_fixed(
                     "size": request['size'],
                     "location": vendor_location_name
                 },
-                "debug_info": {
-                    "action_taken": action_taken,
-                    "vendor_location_name": vendor_location_name
-                }
+                "action_taken": action_taken
             }
             
         else:
@@ -3838,7 +3830,6 @@ async def confirm_product_reception_description_fixed(
             
     except Exception as e:
         conn.rollback()
-        print(f"❌ Error en confirm_reception: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error confirmando recepción: {str(e)}")
     finally:
         conn.close()
