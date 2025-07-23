@@ -3462,27 +3462,35 @@ async def confirm_product_reception(
                     ''', (received_quantity, product_exists['id'], request['size']))
                 else:
                     # Crear producto en el local si no existe
+                    # --- INICIO DEL CÓDIGO CORREGIDO PARA POSTGRESQL ---
                     cursor.execute('''
-                        INSERT INTO products (reference_code, brand, model, color_info, location_name, unit_price, box_price, is_active)
-                        SELECT reference_code, brand, model, color_info, 
-                               (SELECT name FROM locations WHERE id = %s), unit_price, box_price, 1
-                        FROM products 
-                        WHERE reference_code = %s 
+                        INSERT INTO products (
+                            reference_code, brand, model, color_info, description,
+                            location_name, unit_price, box_price, is_active,
+                            image_url, created_at, updated_at -- Agregué campos comunes aquí. ¡Ajusta según tu tabla!
+                        )
+                        SELECT
+                            p.reference_code, p.brand, p.model, p.color_info, p.description,
+                            (SELECT name FROM locations WHERE id = %s), p.unit_price, p.box_price, 1, -- '1' para is_active
+                            p.image_url, p.created_at, p.updated_at -- Agregué campos comunes aquí. ¡Ajusta según tu tabla!
+                        FROM products p
+                        WHERE p.reference_code = %s
                         LIMIT 1
                         RETURNING id
                     ''', (current_user['location_id'], request['sneaker_reference_code']))
-                    
-                    new_product_id = cursor.fetchone()[0]
-                    
+
+                    new_product_id = cursor.fetchone()['id'] # Usar 'id' porque es RealDictCursor
+                    # --- FIN DEL CÓDIGO CORREGIDO PARA POSTGRESQL ---
+
                     cursor.execute('''
                         INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
                         VALUES (%s, %s, %s, 0)
                     ''', (new_product_id, request['size'], received_quantity))
-                
+
                 # Marcar solicitud como completada
                 cursor.execute(
-                    '''UPDATE transfer_requests 
-                       SET status = 'completed', confirmed_reception_at = %s, 
+                    '''UPDATE transfer_requests
+                       SET status = 'completed', confirmed_reception_at = %s,
                            received_quantity = %s, reception_notes = %s
                        WHERE id = %s''',
                     (timestamp, received_quantity, notes, request_id)
