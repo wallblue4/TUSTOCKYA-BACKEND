@@ -3538,14 +3538,16 @@ async def confirm_product_reception_fetchone_fixed(
                         # Crear nueva talla para producto existente
                         cursor.execute('''
                             INSERT INTO product_sizes (
-                                product_id, size, quantity, quantity_exhibition, location_name
-                            ) VALUES (%s, %s, %s, %s, %s)
+                                product_id, size, quantity, quantity_exhibition, location_name, created_at, updated_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ''', (
                             existing_product['id'], 
                             request['size'], 
                             received_quantity, 
                             0,
-                            vendor_location_name
+                            vendor_location_name,
+                            timestamp,  # ✅ FIX: created_at
+                            timestamp   # ✅ FIX: updated_at
                         ))
                         action_taken = "added_new_size_to_existing_product"
                 
@@ -3609,14 +3611,16 @@ async def confirm_product_reception_fetchone_fixed(
                         try:
                             cursor.execute('''
                                 INSERT INTO product_sizes (
-                                    product_id, size, quantity, quantity_exhibition, location_name
-                                ) VALUES (%s, %s, %s, %s, %s)
+                                    product_id, size, quantity, quantity_exhibition, location_name, created_at, updated_at
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                             ''', (
                                 new_product_id, 
                                 request['size'], 
                                 received_quantity, 
                                 0,
-                                vendor_location_name
+                                vendor_location_name,
+                                timestamp,  # ✅ FIX: created_at
+                                timestamp   # ✅ FIX: updated_at
                             ))
                             action_taken = "created_new_product_and_stock"
                             
@@ -3663,14 +3667,16 @@ async def confirm_product_reception_fetchone_fixed(
                         # Crear stock
                         cursor.execute('''
                             INSERT INTO product_sizes (
-                                product_id, size, quantity, quantity_exhibition, location_name
-                            ) VALUES (%s, %s, %s, %s, %s)
+                                product_id, size, quantity, quantity_exhibition, location_name, created_at, updated_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ''', (
                             new_product_id, 
                             request['size'], 
                             received_quantity, 
                             0,
-                            vendor_location_name
+                            vendor_location_name,
+                            timestamp,  # ✅ FIX: created_at
+                            timestamp   # ✅ FIX: updated_at
                         ))
                         action_taken = "created_product_from_transfer_data"
                 
@@ -3704,14 +3710,16 @@ async def confirm_product_reception_fetchone_fixed(
                     else:
                         conn.execute('''
                             INSERT INTO product_sizes (
-                                product_id, size, quantity, quantity_exhibition, location_name
-                            ) VALUES (?, ?, ?, ?, ?)
+                                product_id, size, quantity, quantity_exhibition, location_name, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             existing_product['id'], 
                             request['size'], 
                             received_quantity, 
                             0,
-                            vendor_location_name
+                            vendor_location_name,
+                            timestamp,  # ✅ FIX: created_at
+                            timestamp   # ✅ FIX: updated_at
                         ))
                         action_taken = "added_new_size_to_existing_product"
                 else:
@@ -3749,14 +3757,16 @@ async def confirm_product_reception_fetchone_fixed(
                         
                         conn.execute('''
                             INSERT INTO product_sizes (
-                                product_id, size, quantity, quantity_exhibition, location_name
-                            ) VALUES (?, ?, ?, ?, ?)
+                                product_id, size, quantity, quantity_exhibition, location_name, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             new_product_id, 
                             request['size'], 
                             received_quantity, 
                             0,
-                            vendor_location_name
+                            vendor_location_name,
+                            timestamp,  # ✅ FIX: created_at
+                            timestamp   # ✅ FIX: updated_at
                         ))
                         action_taken = "created_new_product_and_stock"
             
