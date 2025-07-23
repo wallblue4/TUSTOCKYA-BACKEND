@@ -3440,14 +3440,14 @@ async def get_courier_delivery_history(current_user = Depends(get_current_user))
 # ==================== ENDPOINTS ADICIONALES PARA VENDEDOR ====================
 
 @app.post("/api/v1/vendor/confirm-reception/{request_id}")
-async def confirm_product_reception_boolean_fixed(
+async def confirm_product_reception_location_fixed(
     request_id: int,
     received_quantity: int = 1,
     condition_ok: bool = True,
     notes: str = "",
     current_user = Depends(get_current_user)
 ):
-    """VE008: Confirmar recepción - FIX BOOLEAN vs INTEGER"""
+    """VE008: Confirmar recepción - FIX location_name NULL"""
     
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden confirmar recepción")
@@ -3465,6 +3465,15 @@ async def confirm_product_reception_boolean_fixed(
             (request_id, current_user['id'])
         )
         request = cursor.fetchone()
+        
+        # Obtener información de la ubicación del vendedor
+        cursor.execute(
+            'SELECT name FROM locations WHERE id = %s',
+            (current_user['location_id'],)
+        )
+        location_info = cursor.fetchone()
+        vendor_location_name = location_info['name'] if location_info else f"Local #{current_user['location_id']}"
+        
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -3475,6 +3484,14 @@ async def confirm_product_reception_boolean_fixed(
             (request_id, current_user['id'])
         )
         request = cursor.fetchone()
+        
+        # Obtener información de la ubicación del vendedor
+        cursor = conn.execute(
+            'SELECT name FROM locations WHERE id = ?',
+            (current_user['location_id'],)
+        )
+        location_info = cursor.fetchone()
+        vendor_location_name = location_info['name'] if location_info else f"Local #{current_user['location_id']}"
     
     if not request:
         conn.close()
@@ -3491,13 +3508,15 @@ async def confirm_product_reception_boolean_fixed(
                     SELECT p.id, p.reference_code, p.location_name
                     FROM products p 
                     WHERE p.reference_code = %s 
-                    AND p.location_name = (SELECT name FROM locations WHERE id = %s)
-                ''', (request['sneaker_reference_code'], current_user['location_id']))
+                    AND p.location_name = %s
+                ''', (request['sneaker_reference_code'], vendor_location_name))
                 
                 existing_product = cursor.fetchone()
+                print(f"🔍 Producto existente: {existing_product}")
                 
                 if existing_product:
-                    # CASO 1: Producto YA EXISTE - Solo actualizar stock
+                    # CASO 1: Producto YA EXISTE en el local - Actualizar stock
+                    
                     cursor.execute('''
                         SELECT id, quantity FROM product_sizes 
                         WHERE product_id = %s AND size = %s
@@ -3506,64 +3525,120 @@ async def confirm_product_reception_boolean_fixed(
                     existing_size = cursor.fetchone()
                     
                     if existing_size:
-                        # Actualizar stock existente
+                        # Actualizar stock existente de esa talla
                         cursor.execute('''
                             UPDATE product_sizes 
                             SET quantity = quantity + %s
-                            WHERE product_id = %s AND size = %s
-                        ''', (received_quantity, existing_product['id'], request['size']))
+                            WHERE id = %s
+                        ''', (received_quantity, existing_size['id']))
+                        action_taken = "updated_existing_stock"
+                        
                     else:
-                        # Crear nueva talla para producto existente
+                        # ✅ FIX: Incluir location_name al crear nueva talla
                         cursor.execute('''
-                            INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
-                            VALUES (%s, %s, %s, 0)
-                        ''', (existing_product['id'], request['size'], received_quantity))
+                            INSERT INTO product_sizes (
+                                product_id, size, quantity, quantity_exhibition, location_name
+                            ) VALUES (%s, %s, %s, %s, %s)
+                        ''', (
+                            existing_product['id'], 
+                            request['size'], 
+                            received_quantity, 
+                            0,
+                            vendor_location_name  # ✅ FIX: Agregar location_name
+                        ))
+                        action_taken = "added_new_size_to_existing_product"
                 
                 else:
-                    # Crear producto en el local si no existe
-                    # --- INICIO DEL CÓDIGO CORREGIDO PARA POSTGRESQL ---
+                    # CASO 2: Producto NO EXISTE en este local - Crear producto completo
+                    
+                    # Buscar información del producto en otros locales
                     cursor.execute('''
-                        INSERT INTO products (
-                            reference_code, brand, model, color_info, description,
-                            location_name, unit_price, box_price, is_active,
-                            image_url, created_at, updated_at -- Agregué campos comunes aquí. ¡Ajusta según tu tabla!
-                        )
-                        SELECT
-                            p.reference_code, p.brand, p.model, p.color_info, p.description,
-                            (SELECT name FROM locations WHERE id = %s), p.unit_price, p.box_price, 1, -- '1' para is_active
-                            p.image_url, p.created_at, p.updated_at -- Agregué campos comunes aquí. ¡Ajusta según tu tabla!
-                        FROM products p
-                        WHERE p.reference_code = %s
+                        SELECT reference_code, brand, model, color_info, unit_price, box_price
+                        FROM products 
+                        WHERE reference_code = %s 
                         LIMIT 1
-                        RETURNING id
-                    ''', (current_user['location_id'], request['sneaker_reference_code']))
-
-                    new_product_id = cursor.fetchone()['id'] # Usar 'id' porque es RealDictCursor
-                    # --- FIN DEL CÓDIGO CORREGIDO PARA POSTGRESQL ---
-
-                    cursor.execute('''
-                        INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
-                        VALUES (%s, %s, %s, 0)
-                    ''', (new_product_id, request['size'], received_quantity))
-
-                # Marcar solicitud como completada
-                cursor.execute(
-                    '''UPDATE transfer_requests
-                       SET status = 'completed', confirmed_reception_at = %s,
-                           received_quantity = %s, reception_notes = %s
-                       WHERE id = %s''',
-                    (timestamp, received_quantity, notes, request_id)
-                )
-
+                    ''', (request['sneaker_reference_code'],))
+                    
+                    source_product = cursor.fetchone()
+                    
+                    if source_product:
+                        # Crear producto en el local del vendedor
+                        cursor.execute('''
+                            INSERT INTO products (
+                                reference_code, brand, model, color_info, 
+                                location_name, unit_price, box_price, is_active
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                        ''', (
+                            source_product['reference_code'],
+                            source_product['brand'], 
+                            source_product['model'],
+                            source_product['color_info'],
+                            vendor_location_name,  # ✅ Usar nombre real de ubicación
+                            source_product['unit_price'],
+                            source_product['box_price'],
+                            1  # is_active = 1
+                        ))
+                        
+                        new_product_id = cursor.fetchone()[0]
+                        print(f"✅ Producto creado con ID: {new_product_id}")
+                        
+                        # ✅ FIX: Crear stock CON location_name
+                        cursor.execute('''
+                            INSERT INTO product_sizes (
+                                product_id, size, quantity, quantity_exhibition, location_name
+                            ) VALUES (%s, %s, %s, %s, %s)
+                        ''', (
+                            new_product_id, 
+                            request['size'], 
+                            received_quantity, 
+                            0,
+                            vendor_location_name  # ✅ FIX: Incluir location_name
+                        ))
+                        action_taken = "created_new_product_and_stock"
+                    
+                    else:
+                        # Producto no existe en ningún lugar - crear desde datos de transferencia
+                        cursor.execute('''
+                            INSERT INTO products (
+                                reference_code, brand, model, 
+                                location_name, unit_price, box_price, is_active
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            RETURNING id
+                        ''', (
+                            request['sneaker_reference_code'],
+                            request['brand'],
+                            request['model'], 
+                            vendor_location_name,
+                            180.0,  # Precio por defecto
+                            162.0,  # Box price por defecto
+                            1  # is_active = 1
+                        ))
+                        
+                        new_product_id = cursor.fetchone()[0]
+                        
+                        # ✅ FIX: Crear stock CON location_name
+                        cursor.execute('''
+                            INSERT INTO product_sizes (
+                                product_id, size, quantity, quantity_exhibition, location_name
+                            ) VALUES (%s, %s, %s, %s, %s)
+                        ''', (
+                            new_product_id, 
+                            request['size'], 
+                            received_quantity, 
+                            0,
+                            vendor_location_name  # ✅ FIX: Incluir location_name
+                        ))
+                        action_taken = "created_product_from_transfer_data"
                 
             else:
-                # LÓGICA PARA SQLite (usa TRUE/FALSE como boolean)
+                # LÓGICA SIMILAR PARA SQLite
                 cursor = conn.execute('''
                     SELECT p.id, p.reference_code, p.location_name
                     FROM products p 
                     WHERE p.reference_code = ? 
-                    AND p.location_name = (SELECT name FROM locations WHERE id = ?)
-                ''', (request['sneaker_reference_code'], current_user['location_id']))
+                    AND p.location_name = ?
+                ''', (request['sneaker_reference_code'], vendor_location_name))
                 
                 existing_product = cursor.fetchone()
                 
@@ -3580,13 +3655,23 @@ async def confirm_product_reception_boolean_fixed(
                         conn.execute('''
                             UPDATE product_sizes 
                             SET quantity = quantity + ?
-                            WHERE product_id = ? AND size = ?
-                        ''', (received_quantity, existing_product['id'], request['size']))
+                            WHERE id = ?
+                        ''', (received_quantity, existing_size['id']))
+                        action_taken = "updated_existing_stock"
                     else:
+                        # ✅ FIX: Incluir location_name para SQLite también
                         conn.execute('''
-                            INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
-                            VALUES (?, ?, ?, 0)
-                        ''', (existing_product['id'], request['size'], received_quantity))
+                            INSERT INTO product_sizes (
+                                product_id, size, quantity, quantity_exhibition, location_name
+                            ) VALUES (?, ?, ?, ?, ?)
+                        ''', (
+                            existing_product['id'], 
+                            request['size'], 
+                            received_quantity, 
+                            0,
+                            vendor_location_name
+                        ))
+                        action_taken = "added_new_size_to_existing_product"
                 else:
                     # Crear nuevo producto
                     cursor = conn.execute('''
@@ -3609,18 +3694,27 @@ async def confirm_product_reception_boolean_fixed(
                             source_product['brand'], 
                             source_product['model'],
                             source_product['color_info'],
-                            f"Local #{current_user['location_id']}",
+                            vendor_location_name,
                             source_product['unit_price'],
                             source_product['box_price'],
-                            1  # Para SQLite también usar 1
+                            1
                         ))
                         
                         new_product_id = cursor.lastrowid
                         
+                        # ✅ FIX: Crear stock CON location_name
                         conn.execute('''
-                            INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
-                            VALUES (?, ?, ?, 0)
-                        ''', (new_product_id, request['size'], received_quantity))
+                            INSERT INTO product_sizes (
+                                product_id, size, quantity, quantity_exhibition, location_name
+                            ) VALUES (?, ?, ?, ?, ?)
+                        ''', (
+                            new_product_id, 
+                            request['size'], 
+                            received_quantity, 
+                            0,
+                            vendor_location_name
+                        ))
+                        action_taken = "created_new_product_and_stock"
             
             # PASO 3: Actualizar estado de transferencia
             if USE_POSTGRESQL:
@@ -3641,6 +3735,7 @@ async def confirm_product_reception_boolean_fixed(
                 )
             
             conn.commit()
+            print(f"✅ Transacción completada: {action_taken}")
             
             return {
                 "success": True,
@@ -3653,7 +3748,12 @@ async def confirm_product_reception_boolean_fixed(
                     "reference": request['sneaker_reference_code'],
                     "brand": request['brand'],
                     "model": request['model'],
-                    "size": request['size']
+                    "size": request['size'],
+                    "location": vendor_location_name
+                },
+                "debug_info": {
+                    "action_taken": action_taken,
+                    "vendor_location_name": vendor_location_name
                 }
             }
             
@@ -3680,7 +3780,7 @@ async def confirm_product_reception_boolean_fixed(
             
             return {
                 "success": True,
-                "message": "Recepción registrada con observaciones",
+                "message": "Recepción registrada con observaciones - Sin actualización de inventario",
                 "request_id": request_id,
                 "received_quantity": received_quantity,
                 "inventory_updated": False,
@@ -3693,7 +3793,6 @@ async def confirm_product_reception_boolean_fixed(
         print(f"❌ Error en confirm_reception: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error confirmando recepción: {str(e)}")
     finally:
-        conn.close()
 
 
 @app.get("/api/v1/vendor/pending-receptions")
