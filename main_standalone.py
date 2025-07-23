@@ -3899,6 +3899,417 @@ async def get_pending_receptions(current_user = Depends(get_current_user)):
         "urgent_count": len([p for p in pending if p.get('requires_urgent_confirmation', False)])
     }
 
+@app.post("/api/v1/vendor/confirm-reception-debug/{request_id}")
+async def confirm_product_reception_debug(
+    request_id: int,
+    received_quantity: int = 1,
+    condition_ok: bool = True,
+    notes: str = "",
+    current_user = Depends(get_current_user)
+):
+    """VE008: Versión DEBUG para identificar el error exacto"""
+    
+    debug_info = {
+        "step": "inicio",
+        "user_role": current_user.get('role'),
+        "user_id": current_user.get('id'),
+        "user_location_id": current_user.get('location_id'),
+        "request_id": request_id,
+        "received_quantity": received_quantity,
+        "condition_ok": condition_ok
+    }
+    
+    try:
+        if current_user['role'] not in ['seller', 'administrador']:
+            debug_info["error"] = "Role validation failed"
+            raise HTTPException(status_code=403, detail=f"Solo vendedores pueden confirmar recepción. Debug: {debug_info}")
+        
+        debug_info["step"] = "validacion_rol_ok"
+        
+        if USE_POSTGRESQL:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            debug_info["database"] = "PostgreSQL"
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            debug_info["database"] = "SQLite"
+        
+        debug_info["step"] = "conexion_db_ok"
+        
+        # Verificar solicitud
+        try:
+            if USE_POSTGRESQL:
+                cursor.execute(
+                    '''SELECT * FROM transfer_requests 
+                       WHERE id = %s AND requester_id = %s AND status = 'delivered' ''',
+                    (request_id, current_user['id'])
+                )
+                request = cursor.fetchone()
+            else:
+                cursor = conn.execute(
+                    '''SELECT * FROM transfer_requests 
+                       WHERE id = ? AND requester_id = ? AND status = "delivered" ''',
+                    (request_id, current_user['id'])
+                )
+                request = cursor.fetchone()
+            
+            debug_info["step"] = "query_transfer_request_ok"
+            debug_info["transfer_found"] = bool(request)
+            
+            if request:
+                debug_info["transfer_data"] = dict(request)
+            
+        except Exception as e:
+            debug_info["step"] = "error_en_query_transfer"
+            debug_info["error"] = str(e)
+            conn.close()
+            raise HTTPException(status_code=500, detail=f"Error en query transfer: {str(e)}. Debug: {debug_info}")
+        
+        if not request:
+            debug_info["error"] = "Transfer request not found or wrong status"
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Solicitud no encontrada. Debug: {debug_info}")
+        
+        # Obtener información de la ubicación del vendedor
+        try:
+            if USE_POSTGRESQL:
+                cursor.execute(
+                    'SELECT name FROM locations WHERE id = %s',
+                    (current_user['location_id'],)
+                )
+                location_info = cursor.fetchone()
+            else:
+                cursor = conn.execute(
+                    'SELECT name FROM locations WHERE id = ?',
+                    (current_user['location_id'],)
+                )
+                location_info = cursor.fetchone()
+            
+            vendor_location_name = location_info['name'] if location_info else f"Local #{current_user['location_id']}"
+            debug_info["step"] = "location_query_ok"
+            debug_info["vendor_location_name"] = vendor_location_name
+            
+        except Exception as e:
+            debug_info["step"] = "error_en_location_query"
+            debug_info["error"] = str(e)
+            conn.close()
+            raise HTTPException(status_code=500, detail=f"Error en location query: {str(e)}. Debug: {debug_info}")
+        
+        timestamp = datetime.now().isoformat()
+        debug_info["timestamp"] = timestamp
+        debug_info["step"] = "timestamp_created"
+        
+        if condition_ok and received_quantity > 0:
+            debug_info["path"] = "producto_ok_actualizar_inventario"
+            
+            try:
+                if USE_POSTGRESQL:
+                    # PASO 1: Buscar producto existente
+                    debug_info["step"] = "buscando_producto_existente"
+                    cursor.execute('''
+                        SELECT p.id, p.reference_code, p.location_name
+                        FROM products p 
+                        WHERE p.reference_code = %s 
+                        AND p.location_name = %s
+                    ''', (request['sneaker_reference_code'], vendor_location_name))
+                    
+                    existing_product = cursor.fetchone()
+                    debug_info["existing_product"] = dict(existing_product) if existing_product else None
+                    debug_info["step"] = "busqueda_producto_ok"
+                    
+                    if existing_product:
+                        debug_info["case"] = "producto_existe_actualizar_stock"
+                        
+                        # Buscar talla existente
+                        cursor.execute('''
+                            SELECT id, quantity FROM product_sizes 
+                            WHERE product_id = %s AND size = %s
+                        ''', (existing_product['id'], request['size']))
+                        
+                        existing_size = cursor.fetchone()
+                        debug_info["existing_size"] = dict(existing_size) if existing_size else None
+                        
+                        if existing_size:
+                            debug_info["action"] = "actualizar_cantidad_existente"
+                            cursor.execute('''
+                                UPDATE product_sizes 
+                                SET quantity = quantity + %s
+                                WHERE id = %s
+                            ''', (received_quantity, existing_size['id']))
+                            
+                            action_taken = "updated_existing_stock"
+                            debug_info["step"] = "stock_actualizado_ok"
+                            
+                        else:
+                            debug_info["action"] = "crear_nueva_talla"
+                            cursor.execute('''
+                                INSERT INTO product_sizes (
+                                    product_id, size, quantity, quantity_exhibition, location_name
+                                ) VALUES (%s, %s, %s, %s, %s)
+                            ''', (
+                                existing_product['id'], 
+                                request['size'], 
+                                received_quantity, 
+                                0,
+                                vendor_location_name
+                            ))
+                            action_taken = "added_new_size_to_existing_product"
+                            debug_info["step"] = "nueva_talla_creada_ok"
+                    
+                    else:
+                        debug_info["case"] = "producto_no_existe_crear_nuevo"
+                        
+                        # Buscar producto en otros locales
+                        debug_info["step"] = "buscando_producto_en_otros_locales"
+                        cursor.execute('''
+                            SELECT reference_code, brand, model, description, color_info, 
+                                   unit_price, box_price, video_url, image_url
+                            FROM products 
+                            WHERE reference_code = %s 
+                            LIMIT 1
+                        ''', (request['sneaker_reference_code'],))
+                        
+                        source_product = cursor.fetchone()
+                        debug_info["source_product"] = dict(source_product) if source_product else None
+                        debug_info["step"] = "busqueda_source_product_ok"
+                        
+                        if source_product:
+                            debug_info["action"] = "crear_producto_desde_source"
+                            
+                            # Preparar datos para inserción
+                            insert_data = {
+                                "reference_code": source_product['reference_code'],
+                                "brand": source_product['brand'],
+                                "model": source_product['model'],
+                                "description": source_product['description'] or f"{source_product['brand']} {source_product['model']}",
+                                "color_info": source_product['color_info'] or "Varios",
+                                "location_name": vendor_location_name,
+                                "unit_price": source_product['unit_price'] or 0.0,
+                                "box_price": source_product['box_price'] or 0.0,
+                                "is_active": 1,
+                                "video_url": source_product['video_url'],
+                                "image_url": source_product['image_url'],
+                                "created_at": timestamp,
+                                "updated_at": timestamp
+                            }
+                            debug_info["insert_data"] = insert_data
+                            debug_info["step"] = "datos_preparados_para_insert"
+                            
+                            cursor.execute('''
+                                INSERT INTO products (
+                                    reference_code, brand, model, description, color_info, 
+                                    location_name, unit_price, box_price, is_active,
+                                    video_url, image_url, created_at, updated_at
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                RETURNING id
+                            ''', (
+                                insert_data["reference_code"],
+                                insert_data["brand"],
+                                insert_data["model"],
+                                insert_data["description"],
+                                insert_data["color_info"],
+                                insert_data["location_name"],
+                                insert_data["unit_price"],
+                                insert_data["box_price"],
+                                insert_data["is_active"],
+                                insert_data["video_url"],
+                                insert_data["image_url"],
+                                insert_data["created_at"],
+                                insert_data["updated_at"]
+                            ))
+                            
+                            new_product_result = cursor.fetchone()
+                            new_product_id = new_product_result[0]
+                            debug_info["new_product_id"] = new_product_id
+                            debug_info["step"] = "producto_creado_ok"
+                            
+                            # Crear stock
+                            cursor.execute('''
+                                INSERT INTO product_sizes (
+                                    product_id, size, quantity, quantity_exhibition, location_name
+                                ) VALUES (%s, %s, %s, %s, %s)
+                            ''', (
+                                new_product_id, 
+                                request['size'], 
+                                received_quantity, 
+                                0,
+                                vendor_location_name
+                            ))
+                            action_taken = "created_new_product_and_stock"
+                            debug_info["step"] = "stock_inicial_creado_ok"
+                        
+                        else:
+                            debug_info["action"] = "crear_producto_desde_transfer"
+                            product_description = f"{request['brand']} {request['model']}"
+                            
+                            cursor.execute('''
+                                INSERT INTO products (
+                                    reference_code, brand, model, description, color_info,
+                                    location_name, unit_price, box_price, is_active, created_at, updated_at
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                RETURNING id
+                            ''', (
+                                request['sneaker_reference_code'],
+                                request['brand'],
+                                request['model'],
+                                product_description,
+                                "Color estándar",
+                                vendor_location_name,
+                                180.0,
+                                162.0,
+                                1,
+                                timestamp,
+                                timestamp
+                            ))
+                            
+                            new_product_result = cursor.fetchone()
+                            new_product_id = new_product_result[0]
+                            debug_info["new_product_id"] = new_product_id
+                            
+                            cursor.execute('''
+                                INSERT INTO product_sizes (
+                                    product_id, size, quantity, quantity_exhibition, location_name
+                                ) VALUES (%s, %s, %s, %s, %s)
+                            ''', (
+                                new_product_id, 
+                                request['size'], 
+                                received_quantity, 
+                                0,
+                                vendor_location_name
+                            ))
+                            action_taken = "created_product_from_transfer_data"
+                            debug_info["step"] = "producto_desde_transfer_creado_ok"
+                
+                # Actualizar estado de transferencia
+                debug_info["step"] = "actualizando_transfer_request"
+                if USE_POSTGRESQL:
+                    cursor.execute(
+                        '''UPDATE transfer_requests 
+                           SET status = 'completed', confirmed_reception_at = %s, 
+                               received_quantity = %s, reception_notes = %s
+                           WHERE id = %s''',
+                        (timestamp, received_quantity, notes, request_id)
+                    )
+                else:
+                    conn.execute(
+                        '''UPDATE transfer_requests 
+                           SET status = "completed", confirmed_reception_at = ?, 
+                               received_quantity = ?, reception_notes = ?
+                           WHERE id = ?''',
+                        (timestamp, received_quantity, notes, request_id)
+                    )
+                
+                debug_info["step"] = "transfer_actualizado_ok"
+                
+                conn.commit()
+                debug_info["step"] = "commit_exitoso"
+                
+                return {
+                    "success": True,
+                    "message": "Recepción confirmada - Inventario actualizado automáticamente",
+                    "request_id": request_id,
+                    "received_quantity": received_quantity,
+                    "inventory_updated": True,
+                    "confirmed_at": timestamp,
+                    "action_taken": action_taken,
+                    "debug_info": debug_info
+                }
+                
+            except Exception as e:
+                debug_info["step"] = "error_en_procesamiento"
+                debug_info["error"] = str(e)
+                debug_info["error_type"] = type(e).__name__
+                conn.rollback()
+                raise HTTPException(status_code=500, detail=f"Error en procesamiento: {str(e)}. Debug: {debug_info}")
+        
+        else:
+            debug_info["path"] = "producto_con_problemas"
+            # Manejar problemas
+            if USE_POSTGRESQL:
+                cursor.execute(
+                    '''UPDATE transfer_requests 
+                       SET status = 'reception_issues', confirmed_reception_at = %s, 
+                           received_quantity = %s, reception_notes = %s
+                       WHERE id = %s''',
+                    (timestamp, received_quantity, f"Problemas en recepción: {notes}", request_id)
+                )
+            else:
+                conn.execute(
+                    '''UPDATE transfer_requests 
+                       SET status = "reception_issues", confirmed_reception_at = ?, 
+                           received_quantity = ?, reception_notes = ?
+                       WHERE id = ?''',
+                    (timestamp, received_quantity, f"Problemas en recepción: {notes}", request_id)
+                )
+            
+            conn.commit()
+            
+            return {
+                "success": True,
+                "message": "Recepción registrada con observaciones",
+                "request_id": request_id,
+                "inventory_updated": False,
+                "debug_info": debug_info
+            }
+            
+    except HTTPException:
+        # Re-lanzar HTTPExceptions tal como están
+        raise
+    except Exception as e:
+        debug_info["step"] = "error_general_no_capturado"
+        debug_info["error"] = str(e)
+        debug_info["error_type"] = type(e).__name__
+        
+        try:
+            conn.rollback()
+            conn.close()
+        except:
+            pass
+        
+        raise HTTPException(status_code=500, detail=f"Error general: {str(e)}. Debug completo: {debug_info}")
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+
+# ==================== ENDPOINT SIMPLE PARA VERIFICAR DATOS ====================
+
+@app.get("/api/v1/debug/transfer-info/{request_id}")
+async def get_transfer_info(request_id: int, current_user = Depends(get_current_user)):
+    """Ver información completa de una transferencia"""
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute('SELECT * FROM transfer_requests WHERE id = %s', (request_id,))
+        transfer = cursor.fetchone()
+        
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute('SELECT * FROM transfer_requests WHERE id = ?', (request_id,))
+        transfer = cursor.fetchone()
+    
+    conn.close()
+    
+    return {
+        "transfer_found": bool(transfer),
+        "transfer_data": dict(transfer) if transfer else None,
+        "current_user": {
+            "id": current_user['id'],
+            "role": current_user['role'],
+            "location_id": current_user.get('location_id')
+        }
+    }
+
+
 # ==================== TABLAS ADICIONALES NECESARIAS ====================
 
 def create_additional_tables():
