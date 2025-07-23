@@ -3562,13 +3562,13 @@ async def confirm_product_reception_description_fixed(
                     source_product = cursor.fetchone()
                     
                     if source_product:
-                        # ✅ FIX: Incluir description, created_at y otros campos requeridos
+                        # ✅ FIX: Incluir description, created_at, updated_at y otros campos requeridos
                         cursor.execute('''
                             INSERT INTO products (
                                 reference_code, brand, model, description, color_info, 
                                 location_name, unit_price, box_price, is_active,
-                                video_url, image_url, created_at
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                video_url, image_url, created_at, updated_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             RETURNING id
                         ''', (
                             source_product['reference_code'],
@@ -3582,7 +3582,8 @@ async def confirm_product_reception_description_fixed(
                             1,  # is_active = 1
                             source_product['video_url'],  # Puede ser NULL
                             source_product['image_url'],   # Puede ser NULL
-                            timestamp  # ✅ FIX: created_at timestamp
+                            timestamp,  # ✅ FIX: created_at timestamp
+                            timestamp   # ✅ FIX: updated_at timestamp
                         ))
                         
                         new_product_id = cursor.fetchone()[0]
@@ -3841,7 +3842,6 @@ async def confirm_product_reception_description_fixed(
         raise HTTPException(status_code=500, detail=f"Error confirmando recepción: {str(e)}")
     finally:
         conn.close()
-
 
 @app.get("/api/v1/vendor/pending-receptions")
 async def get_pending_receptions(current_user = Depends(get_current_user)):
