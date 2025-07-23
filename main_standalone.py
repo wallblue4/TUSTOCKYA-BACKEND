@@ -4844,61 +4844,100 @@ async def get_inventory_by_location(current_user = Depends(get_current_user)):
 async def get_available_courier_requests(current_user = Depends(get_current_user)):
     """CO001: Recibir notificaciones de solicitudes de transporte"""
     
+    # --- DEBUG 1: Información del usuario autenticado ---
+    print(f"DEBUG: Usuario actual: {current_user}")
+    print(f"DEBUG: Rol del usuario: {current_user.get('role')}")
+    
     if current_user['role'] not in ['corredor', 'administrador']:
+        print(f"DEBUG: Acceso denegado para rol: {current_user.get('role')}")
         raise HTTPException(status_code=403, detail="Solo corredores pueden ver solicitudes")
     
-    if USE_POSTGRESQL:
-        import psycopg2
-        import psycopg2.extras
-        conn = psycopg2.connect(DB_PATH)
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        
-        cursor.execute('''
-            SELECT tr.*, 
-                   u.first_name as requester_first_name,
-                   u.last_name as requester_last_name,
-                   sl.name as source_location_name,
-                   sl.address as source_address,
-                   dl.name as destination_location_name,
-                   dl.address as destination_address,
-                   wk.first_name as warehouse_keeper_first_name,
-                   wk.last_name as warehouse_keeper_last_name
-            FROM transfer_requests tr
-            JOIN users u ON tr.requester_id = u.id
-            JOIN locations sl ON tr.source_location_id = sl.id
-            JOIN locations dl ON tr.destination_location_id = dl.id
-            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
-            WHERE tr.status IN ('accepted', 'in_transit') 
-            AND (tr.courier_id IS NULL OR tr.courier_id = %s)
-            ORDER BY tr.accepted_at ASC
-        ''', (current_user['id'],))
-        requests = [dict(row) for row in cursor.fetchall()]
-    else:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        
-        cursor = conn.execute('''
-            SELECT tr.*, 
-                   u.first_name as requester_first_name,
-                   u.last_name as requester_last_name,
-                   sl.name as source_location_name,
-                   sl.address as source_address,
-                   dl.name as destination_location_name,
-                   dl.address as destination_address,
-                   wk.first_name as warehouse_keeper_first_name,
-                   wk.last_name as warehouse_keeper_last_name
-            FROM transfer_requests tr
-            JOIN users u ON tr.requester_id = u.id
-            JOIN locations sl ON tr.source_location_id = sl.id
-            JOIN locations dl ON tr.destination_location_id = dl.id
-            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
-            WHERE tr.status IN ("accepted", "in_transit") 
-            AND (tr.courier_id IS NULL OR tr.courier_id = ?)
-            ORDER BY tr.accepted_at ASC
-        ''', (current_user['id'],))
-        requests = [dict(row) for row in cursor.fetchall()]
-    
-    conn.close
+    conn = None # Inicializa conn
+    cursor = None # Inicializa cursor
+    requests = [] # Inicializa requests para asegurar que siempre haya una lista
+
+    try:
+        if USE_POSTGRESQL:
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            print(f"DEBUG: Conectado a PostgreSQL en: {DB_PATH}")
+            
+            query = '''
+                SELECT tr.*, 
+                       u.first_name as requester_first_name,
+                       u.last_name as requester_last_name,
+                       sl.name as source_location_name,
+                       sl.address as source_address,
+                       dl.name as destination_location_name,
+                       dl.address as destination_address,
+                       wk.first_name as warehouse_keeper_first_name,
+                       wk.last_name as warehouse_keeper_last_name
+                FROM transfer_requests tr
+                JOIN users u ON tr.requester_id = u.id
+                JOIN locations sl ON tr.source_location_id = sl.id
+                JOIN locations dl ON tr.destination_location_id = dl.id
+                LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+                WHERE tr.status IN ('accepted', 'in_transit') 
+                AND (tr.courier_id IS NULL OR tr.courier_id = %s)
+                ORDER BY tr.accepted_at ASC
+            '''
+            # --- DEBUG 2: Parámetros de la consulta SQL ---
+            print(f"DEBUG: Ejecutando consulta PostgreSQL con courier_id: {current_user['id']}")
+            cursor.execute(query, (current_user['id'],))
+            requests = [dict(row) for row in cursor.fetchall()]
+            
+        else: # Uso de SQLite
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            print(f"DEBUG: Conectado a SQLite en: {DB_PATH}")
+
+            query = '''
+                SELECT tr.*, 
+                       u.first_name as requester_first_name,
+                       u.last_name as requester_last_name,
+                       sl.name as source_location_name,
+                       sl.address as source_address,
+                       dl.name as destination_location_name,
+                       dl.address as destination_address,
+                       wk.first_name as warehouse_keeper_first_name,
+                       wk.last_name as warehouse_keeper_last_name
+                FROM transfer_requests tr
+                JOIN users u ON tr.requester_id = u.id
+                JOIN locations sl ON tr.source_location_id = sl.id
+                JOIN locations dl ON tr.destination_location_id = dl.id
+                LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+                WHERE tr.status IN ("accepted", "in_transit") 
+                AND (tr.courier_id IS NULL OR tr.courier_id = ?)
+                ORDER BY tr.accepted_at ASC
+            '''
+            # --- DEBUG 2: Parámetros de la consulta SQL ---
+            print(f"DEBUG: Ejecutando consulta SQLite con courier_id: {current_user['id']}")
+            cursor = conn.execute(query, (current_user['id'],))
+            requests = [dict(row) for row in cursor.fetchall()]
+
+        # --- DEBUG 3: Resultados de la consulta ---
+        print(f"DEBUG: Número de solicitudes encontradas: {len(requests)}")
+        if requests:
+            print(f"DEBUG: Primeras 2 solicitudes (si existen): {requests[:2]}")
+        else:
+            print("DEBUG: No se encontraron solicitudes que cumplan los criterios.")
+
+    except (psycopg2.Error, sqlite3.Error) as e:
+        print(f"ERROR: Error de base de datos: {str(e)}")
+        if conn:
+            conn.rollback() # Asegurarse de hacer rollback si algo falla antes del commit
+        raise HTTPException(status_code=500, detail=f"Error de base de datos al obtener solicitudes: {str(e)}")
+    except Exception as e:
+        print(f"ERROR: Ocurrió un error inesperado en el servicio: {str(e)}")
+        if conn:
+            conn.rollback() # Asegurarse de hacer rollback si algo falla
+        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+            print("DEBUG: Conexión a la base de datos cerrada.")
+
+    return requests # El servicio retorna directamente la lista de solicitudes
 
 
 
