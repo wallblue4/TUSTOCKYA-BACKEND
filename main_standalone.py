@@ -5171,7 +5171,7 @@ async def release_product_reservation(
 
 @app.get("/api/v1/warehouse/pending-requests")
 async def get_pending_transfer_requests(current_user = Depends(get_current_user)):
-    """BG001: Recibir y procesar solicitudes de productos"""
+    """BG001: Recibir y procesar solicitudes de productos - CON IMÁGENES"""
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes")
@@ -5187,14 +5187,21 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
                    u.first_name as requester_first_name,
                    u.last_name as requester_last_name,
                    sl.name as source_location_name,
-                   dl.name as destination_location_name
+                   dl.name as destination_location_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.color_info as product_color
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND p.location_name = sl.name)
             WHERE tr.status = 'pending' 
             AND sl.id = %s
-            ORDER BY tr.requested_at ASC
+            ORDER BY 
+                CASE WHEN tr.purpose = 'cliente' THEN 1 ELSE 2 END,
+                tr.requested_at ASC
         ''', (current_user['location_id'],))
         requests = [dict(row) for row in cursor.fetchall()]
     else:
@@ -5206,20 +5213,27 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
                    u.first_name as requester_first_name,
                    u.last_name as requester_last_name,
                    sl.name as source_location_name,
-                   dl.name as destination_location_name
+                   dl.name as destination_location_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.color_info as product_color
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND p.location_name = sl.name)
             WHERE tr.status = "pending" 
             AND sl.id = ?
-            ORDER BY tr.requested_at ASC
+            ORDER BY 
+                CASE WHEN tr.purpose = "cliente" THEN 1 ELSE 2 END,
+                tr.requested_at ASC
         ''', (current_user['location_id'],))
         requests = [dict(row) for row in cursor.fetchall()]
     
     conn.close()
     
-    # Agregar información de stock disponible
+    # Agregar información de stock y imagen fallback
     for request in requests:
         availability = check_product_availability(
             request['sneaker_reference_code'],
@@ -5227,12 +5241,21 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             request['quantity'],
             request['source_location_id']
         )
+        
+        # Campos que espera el frontend
+        request['can_fulfill'] = availability['can_fulfill']
+        request['available_stock'] = availability['available_stock']
         request['stock_info'] = availability
+        
+        # ✅ NUEVO: Imagen fallback si no hay imagen del producto
+        if not request['product_image']:
+            request['product_image'] = f"https://via.placeholder.com/300x200?text={request['brand']}+{request['model']}"
     
     return {
         "success": True,
         "pending_requests": requests,
         "count": len(requests),
+        "urgent_count": len([r for r in requests if r.get('priority') == 'high']),
         "location_info": {
             "bodeguero": f"{current_user['first_name']} {current_user['last_name']}",
             "location_id": current_user['location_id']
@@ -5241,7 +5264,7 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
 
 @app.get("/api/v1/warehouse/accepted-requests")
 async def get_accepted_transfer_requests(current_user = Depends(get_current_user)):
-    """BG002: Ver solicitudes aceptadas y en preparación"""
+    """BG002: Ver solicitudes aceptadas y en preparación - CON IMÁGENES"""
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes aceptadas")
@@ -5259,12 +5282,17 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
                    sl.name as source_location_name,
                    dl.name as destination_location_name,
                    c.first_name as courier_first_name,
-                   c.last_name as courier_last_name
+                   c.last_name as courier_last_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.color_info as product_color
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
             LEFT JOIN users c ON tr.courier_id = c.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND p.location_name = sl.name)
             WHERE tr.status IN ('accepted', 'courier_assigned', 'in_transit')
             AND tr.warehouse_keeper_id = %s
             ORDER BY 
@@ -5287,12 +5315,17 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
                    sl.name as source_location_name,
                    dl.name as destination_location_name,
                    c.first_name as courier_first_name,
-                   c.last_name as courier_last_name
+                   c.last_name as courier_last_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.color_info as product_color
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
             LEFT JOIN users c ON tr.courier_id = c.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND p.location_name = sl.name)
             WHERE tr.status IN ("accepted", "courier_assigned", "in_transit")
             AND tr.warehouse_keeper_id = ?
             ORDER BY 
@@ -5307,7 +5340,7 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
     
     conn.close()
     
-    # Agregar información de estado para cada solicitud
+    # Agregar información de estado y imagen fallback
     for request in requests:
         if request['status'] == 'accepted':
             request['status_description'] = 'Esperando corredor'
@@ -5321,6 +5354,10 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
             request['status_description'] = 'En tránsito al destino'
             request['action_available'] = False
             request['ready_for_pickup'] = False
+        
+        # ✅ NUEVO: Imagen fallback
+        if not request['product_image']:
+            request['product_image'] = f"https://via.placeholder.com/300x200?text={request['brand']}+{request['model']}"
     
     return {
         "success": True,
