@@ -4842,102 +4842,483 @@ async def get_inventory_by_location(current_user = Depends(get_current_user)):
 
 @app.get("/api/v1/courier/available-requests")
 async def get_available_courier_requests(current_user = Depends(get_current_user)):
-    """CO001: Recibir notificaciones de solicitudes de transporte"""
-    
-    # --- DEBUG 1: Información del usuario autenticado ---
-    print(f"DEBUG: Usuario actual: {current_user}")
-    print(f"DEBUG: Rol del usuario: {current_user.get('role')}")
+    """CO001: Recibir notificaciones de solicitudes de transporte - FLUJO CORREGIDO"""
     
     if current_user['role'] not in ['corredor', 'administrador']:
-        print(f"DEBUG: Acceso denegado para rol: {current_user.get('role')}")
         raise HTTPException(status_code=403, detail="Solo corredores pueden ver solicitudes")
     
-    conn = None # Inicializa conn
-    cursor = None # Inicializa cursor
-    requests = [] # Inicializa requests para asegurar que siempre haya una lista
-
-    try:
-        if USE_POSTGRESQL:
-            conn = psycopg2.connect(DB_PATH)
-            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            print(f"DEBUG: Conectado a PostgreSQL en: {DB_PATH}")
-            
-            query = '''
-                SELECT tr.*, 
-                       u.first_name as requester_first_name,
-                       u.last_name as requester_last_name,
-                       sl.name as source_location_name,
-                       sl.address as source_address,
-                       dl.name as destination_location_name,
-                       dl.address as destination_address,
-                       wk.first_name as warehouse_keeper_first_name,
-                       wk.last_name as warehouse_keeper_last_name
-                FROM transfer_requests tr
-                JOIN users u ON tr.requester_id = u.id
-                JOIN locations sl ON tr.source_location_id = sl.id
-                JOIN locations dl ON tr.destination_location_id = dl.id
-                LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
-                WHERE tr.status IN ('accepted', 'in_transit') 
-                AND (tr.courier_id IS NULL OR tr.courier_id = %s)
-                ORDER BY tr.accepted_at ASC
-            '''
-            # --- DEBUG 2: Parámetros de la consulta SQL ---
-            print(f"DEBUG: Ejecutando consulta PostgreSQL con courier_id: {current_user['id']}")
-            cursor.execute(query, (current_user['id'],))
-            requests = [dict(row) for row in cursor.fetchall()]
-            
-        else: # Uso de SQLite
-            conn = sqlite3.connect(DB_PATH)
-            conn.row_factory = sqlite3.Row
-            print(f"DEBUG: Conectado a SQLite en: {DB_PATH}")
-
-            query = '''
-                SELECT tr.*, 
-                       u.first_name as requester_first_name,
-                       u.last_name as requester_last_name,
-                       sl.name as source_location_name,
-                       sl.address as source_address,
-                       dl.name as destination_location_name,
-                       dl.address as destination_address,
-                       wk.first_name as warehouse_keeper_first_name,
-                       wk.last_name as warehouse_keeper_last_name
-                FROM transfer_requests tr
-                JOIN users u ON tr.requester_id = u.id
-                JOIN locations sl ON tr.source_location_id = sl.id
-                JOIN locations dl ON tr.destination_location_id = dl.id
-                LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
-                WHERE tr.status IN ("accepted", "in_transit") 
-                AND (tr.courier_id IS NULL OR tr.courier_id = ?)
-                ORDER BY tr.accepted_at ASC
-            '''
-            # --- DEBUG 2: Parámetros de la consulta SQL ---
-            print(f"DEBUG: Ejecutando consulta SQLite con courier_id: {current_user['id']}")
-            cursor = conn.execute(query, (current_user['id'],))
-            requests = [dict(row) for row in cursor.fetchall()]
-
-        # --- DEBUG 3: Resultados de la consulta ---
-        print(f"DEBUG: Número de solicitudes encontradas: {len(requests)}")
-        if requests:
-            print(f"DEBUG: Primeras 2 solicitudes (si existen): {requests[:2]}")
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # CONSULTA CORREGIDA: Separar transferencias disponibles vs las del corredor actual
+        cursor.execute('''
+            SELECT tr.*, 
+                   u.first_name as requester_first_name,
+                   u.last_name as requester_last_name,
+                   sl.name as source_location_name,
+                   sl.address as source_address,
+                   dl.name as destination_location_name,
+                   dl.address as destination_address,
+                   wk.first_name as warehouse_keeper_first_name,
+                   wk.last_name as warehouse_keeper_last_name,
+                   c.first_name as courier_first_name,
+                   c.last_name as courier_last_name
+            FROM transfer_requests tr
+            JOIN users u ON tr.requester_id = u.id
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+            LEFT JOIN users c ON tr.courier_id = c.id
+            WHERE (
+                -- Caso 1: Transferencias aceptadas por bodeguero, disponibles para corredores
+                (tr.status = 'accepted' AND tr.courier_id IS NULL)
+                OR
+                -- Caso 2: Transferencias ya asignadas al corredor actual (en cualquier estado posterior)
+                (tr.courier_id = %s AND tr.status IN ('courier_assigned', 'in_transit'))
+            )
+            ORDER BY 
+                CASE WHEN tr.purpose = 'cliente' THEN 1 ELSE 2 END, -- Prioridad cliente
+                tr.accepted_at ASC
+        ''', (current_user['id'],))
+        requests = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute('''
+            SELECT tr.*, 
+                   u.first_name as requester_first_name,
+                   u.last_name as requester_last_name,
+                   sl.name as source_location_name,
+                   sl.address as source_address,
+                   dl.name as destination_location_name,
+                   dl.address as destination_address,
+                   wk.first_name as warehouse_keeper_first_name,
+                   wk.last_name as warehouse_keeper_last_name,
+                   c.first_name as courier_first_name,
+                   c.last_name as courier_last_name
+            FROM transfer_requests tr
+            JOIN users u ON tr.requester_id = u.id
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+            LEFT JOIN users c ON tr.courier_id = c.id
+            WHERE (
+                -- Caso 1: Transferencias aceptadas por bodeguero, disponibles para corredores
+                (tr.status = "accepted" AND tr.courier_id IS NULL)
+                OR
+                -- Caso 2: Transferencias ya asignadas al corredor actual
+                (tr.courier_id = ? AND tr.status IN ("courier_assigned", "in_transit"))
+            )
+            ORDER BY 
+                CASE WHEN tr.purpose = "cliente" THEN 1 ELSE 2 END,
+                tr.accepted_at ASC
+        ''', (current_user['id'],))
+        requests = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    # Procesar resultados y agregar información específica por estado
+    for request in requests:
+        # Calcular tiempo desde aceptación
+        if request['accepted_at']:
+            try:
+                accepted_time = datetime.fromisoformat(request['accepted_at'])
+                time_since_accepted = datetime.now() - accepted_time
+                request['hours_since_accepted'] = time_since_accepted.total_seconds() / 3600
+            except:
+                request['hours_since_accepted'] = 0
         else:
-            print("DEBUG: No se encontraron solicitudes que cumplan los criterios.")
+            request['hours_since_accepted'] = 0
+        
+        # Información específica según el estado
+        if request['status'] == 'accepted' and request['courier_id'] is None:
+            # Disponible para aceptar
+            request['action_required'] = "accept_transport"
+            request['status_description'] = "Disponible para aceptar transporte"
+            request['next_step'] = "Aceptar esta solicitud de transporte"
+        elif request['status'] == 'courier_assigned' and request['courier_id'] == current_user['id']:
+            # Ya aceptada por este corredor, debe ir a recoger
+            request['action_required'] = "go_pickup"
+            request['status_description'] = "Asignada a ti - ve a recoger"
+            request['next_step'] = "Dirigirse a recoger el producto"
+        elif request['status'] == 'in_transit' and request['courier_id'] == current_user['id']:
+            # En tránsito, debe entregar
+            request['action_required'] = "deliver"
+            request['status_description'] = "En tránsito - entregar al destino"
+            request['next_step'] = "Entregar producto en destino"
+        
+        # Información general del request
+        request['request_info'] = {
+            "pickup_location": request['source_location_name'],
+            "pickup_address": request['source_address'] or "Dirección no disponible",
+            "delivery_location": request['destination_location_name'],
+            "delivery_address": request['destination_address'] or "Dirección no disponible",
+            "product_description": f"{request['brand']} {request['model']} - Talla {request['size']}",
+            "urgency": "🔥 Cliente presente" if request['purpose'] == 'cliente' else "📦 Restock",
+            "warehouse_keeper": f"{request['warehouse_keeper_first_name'] or ''} {request['warehouse_keeper_last_name'] or ''}".strip() or "No asignado",
+            "requester": f"{request['requester_first_name']} {request['requester_last_name']}"
+        }
+    
+    return {
+        "success": True,
+        "available_requests": requests,
+        "count": len(requests),
+        "breakdown": {
+            "available_to_accept": len([r for r in requests if r['status'] == 'accepted' and r['courier_id'] is None]),
+            "assigned_to_me": len([r for r in requests if r['courier_id'] == current_user['id']]),
+            "ready_for_pickup": len([r for r in requests if r['status'] == 'courier_assigned' and r['courier_id'] == current_user['id']]),
+            "in_transit": len([r for r in requests if r['status'] == 'in_transit' and r['courier_id'] == current_user['id']])
+        },
+        "courier_info": {
+            "name": f"{current_user['first_name']} {current_user['last_name']}",
+            "courier_id": current_user['id']
+        }
+    }
 
-    except (psycopg2.Error, sqlite3.Error) as e:
-        print(f"ERROR: Error de base de datos: {str(e)}")
-        if conn:
-            conn.rollback() # Asegurarse de hacer rollback si algo falla antes del commit
-        raise HTTPException(status_code=500, detail=f"Error de base de datos al obtener solicitudes: {str(e)}")
-    except Exception as e:
-        print(f"ERROR: Ocurrió un error inesperado en el servicio: {str(e)}")
-        if conn:
-            conn.rollback() # Asegurarse de hacer rollback si algo falla
-        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
-    finally:
-        if conn:
+# ==================== ENDPOINT CORREGIDO PARA ACEPTAR TRANSPORTE ====================
+
+@app.post("/api/v1/courier/accept-request/{request_id}")
+async def accept_courier_request(
+    request_id: int,
+    estimated_pickup_time: int = 20,  # minutos estimados para llegar
+    notes: str = "",
+    current_user = Depends(get_current_user)
+):
+    """CO002: Aceptar solicitud e iniciar recorrido - FLUJO CORREGIDO CON CONCURRENCIA"""
+    
+    if current_user['role'] not in ['corredor', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo corredores pueden aceptar solicitudes")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # VERIFICAR Y ASIGNAR EN UNA SOLA TRANSACCIÓN (prevenir race conditions)
+        cursor.execute('BEGIN')
+        
+        try:
+            # Verificar que la solicitud esté disponible (accepted + sin corredor)
+            cursor.execute(
+                '''SELECT * FROM transfer_requests 
+                   WHERE id = %s AND status = 'accepted' AND courier_id IS NULL
+                   FOR UPDATE''',  # Bloquear la fila para prevenir concurrencia
+                (request_id,)
+            )
+            request = cursor.fetchone()
+            
+            if not request:
+                cursor.execute('ROLLBACK')
+                conn.close()
+                raise HTTPException(
+                    status_code=409, 
+                    detail="Solicitud no disponible - ya fue tomada por otro corredor o no existe"
+                )
+            
+            # Asignar corredor y cambiar estado
+            timestamp = datetime.now().isoformat()
+            cursor.execute(
+                '''UPDATE transfer_requests 
+                   SET courier_id = %s, status = 'courier_assigned', 
+                       courier_accepted_at = %s, courier_notes = %s,
+                       estimated_pickup_time = %s
+                   WHERE id = %s''',
+                (current_user['id'], timestamp, notes, estimated_pickup_time, request_id)
+            )
+            
+            cursor.execute('COMMIT')
+            
+        except Exception as e:
+            cursor.execute('ROLLBACK')
             conn.close()
-            print("DEBUG: Conexión a la base de datos cerrada.")
+            raise HTTPException(status_code=500, detail=f"Error asignando solicitud: {str(e)}")
+            
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        
+        # Para SQLite usamos transacción manual
+        conn.execute('BEGIN')
+        
+        try:
+            # Verificar disponibilidad
+            cursor = conn.execute(
+                '''SELECT * FROM transfer_requests 
+                   WHERE id = ? AND status = "accepted" AND courier_id IS NULL''',
+                (request_id,)
+            )
+            request = cursor.fetchone()
+            
+            if not request:
+                conn.rollback()
+                conn.close()
+                raise HTTPException(
+                    status_code=409, 
+                    detail="Solicitud no disponible - ya fue tomada por otro corredor"
+                )
+            
+            # Asignar corredor
+            timestamp = datetime.now().isoformat()
+            conn.execute(
+                '''UPDATE transfer_requests 
+                   SET courier_id = ?, status = "courier_assigned", 
+                       courier_accepted_at = ?, courier_notes = ?,
+                       estimated_pickup_time = ?
+                   WHERE id = ?''',
+                (current_user['id'], timestamp, notes, estimated_pickup_time, request_id)
+            )
+            
+            conn.commit()
+            
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            raise HTTPException(status_code=500, detail=f"Error asignando solicitud: {str(e)}")
+    
+    conn.close()
+    
+    return {
+        "success": True,
+        "message": "Solicitud de transporte aceptada exitosamente",
+        "request_id": request_id,
+        "status": "courier_assigned",
+        "courier_assigned": f"{current_user['first_name']} {current_user['last_name']}",
+        "estimated_pickup_time": estimated_pickup_time,
+        "accepted_at": timestamp,
+        "next_steps": [
+            f"Dirigirse al punto de recolección en aproximadamente {estimated_pickup_time} minutos",
+            "Confirmar recolección cuando tengas el producto",
+            "Transportar al destino y confirmar entrega"
+        ]
+    }
 
-    return requests # El servicio retorna directamente la lista de solicitudes
+# ==================== ENDPOINT PARA VER MIS TRANSPORTES ASIGNADOS ====================
+
+@app.get("/api/v1/courier/my-assigned-transports")
+async def get_my_assigned_transports(current_user = Depends(get_current_user)):
+    """Ver transportes específicamente asignados a este corredor"""
+    
+    if current_user['role'] not in ['corredor', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo corredores")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute('''
+            SELECT tr.*, 
+                   u.first_name as requester_first_name,
+                   u.last_name as requester_last_name,
+                   sl.name as source_location_name,
+                   dl.name as destination_location_name
+            FROM transfer_requests tr
+            JOIN users u ON tr.requester_id = u.id
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            WHERE tr.courier_id = %s 
+            AND tr.status IN ('courier_assigned', 'in_transit', 'delivered')
+            ORDER BY 
+                CASE tr.status 
+                    WHEN 'courier_assigned' THEN 1 
+                    WHEN 'in_transit' THEN 2 
+                    WHEN 'delivered' THEN 3 
+                END,
+                tr.courier_accepted_at ASC
+        ''', (current_user['id'],))
+        transports = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute('''
+            SELECT tr.*, 
+                   u.first_name as requester_first_name,
+                   u.last_name as requester_last_name,
+                   sl.name as source_location_name,
+                   dl.name as destination_location_name
+            FROM transfer_requests tr
+            JOIN users u ON tr.requester_id = u.id
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            WHERE tr.courier_id = ? 
+            AND tr.status IN ("courier_assigned", "in_transit", "delivered")
+            ORDER BY 
+                CASE tr.status 
+                    WHEN "courier_assigned" THEN 1 
+                    WHEN "in_transit" THEN 2 
+                    WHEN "delivered" THEN 3 
+                END,
+                tr.courier_accepted_at ASC
+        ''', (current_user['id'],))
+        transports = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    # Agregar información de acción requerida
+    for transport in transports:
+        if transport['status'] == 'courier_assigned':
+            transport['action_required'] = "ir_a_recoger"
+            transport['action_description'] = "Ve al punto de recolección"
+        elif transport['status'] == 'in_transit':
+            transport['action_required'] = "entregar"
+            transport['action_description'] = "Entregar en destino"
+        elif transport['status'] == 'delivered':
+            transport['action_required'] = "completado"
+            transport['action_description'] = "Esperando confirmación del vendedor"
+    
+    return {
+        "success": True,
+        "my_transports": transports,
+        "count": len(transports),
+        "status_breakdown": {
+            "ready_for_pickup": len([t for t in transports if t['status'] == 'courier_assigned']),
+            "in_transit": len([t for t in transports if t['status'] == 'in_transit']),
+            "awaiting_confirmation": len([t for t in transports if t['status'] == 'delivered'])
+        }
+    }
+
+# ==================== ACTUALIZAR ENDPOINT DE CONFIRMACIÓN DE RECOLECCIÓN ====================
+
+@app.post("/api/v1/courier/confirm-pickup/{request_id}")
+async def confirm_pickup(
+    request_id: int,
+    pickup_notes: str = "",
+    current_user = Depends(get_current_user)
+):
+    """CO003: Confirmar recolección - SOLO SI YA ESTÁ ASIGNADO AL CORREDOR"""
+    
+    if current_user['role'] not in ['corredor', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo corredores pueden confirmar recolección")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Verificar que la transferencia está asignada a este corredor y lista para recoger
+        cursor.execute(
+            '''SELECT * FROM transfer_requests 
+               WHERE id = %s AND courier_id = %s AND status = 'courier_assigned' ''',
+            (request_id, current_user['id'])
+        )
+        request = cursor.fetchone()
+        
+        if not request:
+            conn.close()
+            raise HTTPException(
+                status_code=400, 
+                detail="No puedes confirmar recolección - solicitud no asignada a ti o en estado incorrecto"
+            )
+        
+        # Cambiar a estado 'in_transit'
+        timestamp = datetime.now().isoformat()
+        cursor.execute(
+            '''UPDATE transfer_requests 
+               SET status = 'in_transit', picked_up_at = %s, pickup_notes = %s
+               WHERE id = %s''',
+            (timestamp, pickup_notes, request_id)
+        )
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        
+        cursor = conn.execute(
+            '''SELECT * FROM transfer_requests 
+               WHERE id = ? AND courier_id = ? AND status = "courier_assigned" ''',
+            (request_id, current_user['id'])
+        )
+        request = cursor.fetchone()
+        
+        if not request:
+            conn.close()
+            raise HTTPException(
+                status_code=400, 
+                detail="No puedes confirmar recolección - solicitud no asignada a ti"
+            )
+        
+        timestamp = datetime.now().isoformat()
+        conn.execute(
+            '''UPDATE transfer_requests 
+               SET status = "in_transit", picked_up_at = ?, pickup_notes = ?
+               WHERE id = ?''',
+            (timestamp, pickup_notes, request_id)
+        )
+    
+    conn.commit()
+    conn.close()
+    
+    return {
+        "success": True,
+        "message": "Recolección confirmada - Producto en tránsito",
+        "request_id": request_id,
+        "status": "in_transit",
+        "picked_up_at": timestamp,
+        "next_step": "Dirigirse al punto de entrega"
+    }
+
+# ==================== AGREGAR CAMPOS A LA TABLA ====================
+
+def add_courier_fields_to_transfer_requests():
+    """Agregar campos necesarios para el flujo completo del corredor"""
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        try:
+            # Agregar campos específicos del corredor
+            cursor.execute('ALTER TABLE transfer_requests ADD COLUMN courier_accepted_at TIMESTAMP')
+            cursor.execute('ALTER TABLE transfer_requests ADD COLUMN courier_notes TEXT')
+            cursor.execute('ALTER TABLE transfer_requests ADD COLUMN estimated_pickup_time INTEGER')
+            cursor.execute('ALTER TABLE transfer_requests ADD COLUMN pickup_notes TEXT')
+            print("✅ Campos del corredor agregados a PostgreSQL")
+        except Exception as e:
+            print(f"⚠️ Campos ya existen o error: {e}")
+            
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        
+        try:
+            conn.execute('ALTER TABLE transfer_requests ADD COLUMN courier_accepted_at TEXT')
+            conn.execute('ALTER TABLE transfer_requests ADD COLUMN courier_notes TEXT')
+            conn.execute('ALTER TABLE transfer_requests ADD COLUMN estimated_pickup_time INTEGER')
+            conn.execute('ALTER TABLE transfer_requests ADD COLUMN pickup_notes TEXT')
+            print("✅ Campos del corredor agregados a SQLite")
+        except Exception as e:
+            print(f"⚠️ Campos ya existen o error: {e}")
+    
+    conn.commit()
+    conn.close()
+
+# ==================== ENDPOINT PARA AGREGAR CAMPOS ====================
+
+@app.post("/api/v1/admin/add-courier-fields")
+async def add_courier_fields(current_user = Depends(get_current_user)):
+    """Agregar campos necesarios para el flujo completo del corredor"""
+    
+    if current_user['role'] != 'administrador':
+        raise HTTPException(status_code=403, detail="Solo administradores")
+    
+    try:
+        add_courier_fields_to_transfer_requests()
+        return {
+            "success": True,
+            "message": "Campos del corredor agregados exitosamente",
+            "fields_added": [
+                "courier_accepted_at - Timestamp cuando corredor acepta",
+                "courier_notes - Notas del corredor al aceptar",
+                "estimated_pickup_time - Tiempo estimado para recolección", 
+                "pickup_notes - Notas del corredor al recoger"
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error agregando campos: {str(e)}")
 
 
 
