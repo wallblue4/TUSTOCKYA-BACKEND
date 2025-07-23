@@ -5239,6 +5239,101 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
         }
     }
 
+@app.get("/api/v1/warehouse/accepted-requests")
+async def get_accepted_transfer_requests(current_user = Depends(get_current_user)):
+    """BG002: Ver solicitudes aceptadas y en preparación"""
+    
+    if current_user['role'] not in ['bodeguero', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes aceptadas")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute('''
+            SELECT tr.*, 
+                   u.first_name as requester_first_name,
+                   u.last_name as requester_last_name,
+                   sl.name as source_location_name,
+                   dl.name as destination_location_name,
+                   c.first_name as courier_first_name,
+                   c.last_name as courier_last_name
+            FROM transfer_requests tr
+            JOIN users u ON tr.requester_id = u.id
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN users c ON tr.courier_id = c.id
+            WHERE tr.status IN ('accepted', 'courier_assigned', 'in_transit')
+            AND tr.warehouse_keeper_id = %s
+            ORDER BY 
+                CASE tr.status 
+                    WHEN 'accepted' THEN 1 
+                    WHEN 'courier_assigned' THEN 2 
+                    WHEN 'in_transit' THEN 3 
+                END,
+                tr.accepted_at ASC
+        ''', (current_user['id'],))
+        requests = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute('''
+            SELECT tr.*, 
+                   u.first_name as requester_first_name,
+                   u.last_name as requester_last_name,
+                   sl.name as source_location_name,
+                   dl.name as destination_location_name,
+                   c.first_name as courier_first_name,
+                   c.last_name as courier_last_name
+            FROM transfer_requests tr
+            JOIN users u ON tr.requester_id = u.id
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN users c ON tr.courier_id = c.id
+            WHERE tr.status IN ("accepted", "courier_assigned", "in_transit")
+            AND tr.warehouse_keeper_id = ?
+            ORDER BY 
+                CASE tr.status 
+                    WHEN "accepted" THEN 1 
+                    WHEN "courier_assigned" THEN 2 
+                    WHEN "in_transit" THEN 3 
+                END,
+                tr.accepted_at ASC
+        ''', (current_user['id'],))
+        requests = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    # Agregar información de estado para cada solicitud
+    for request in requests:
+        if request['status'] == 'accepted':
+            request['status_description'] = 'Esperando corredor'
+            request['action_available'] = False
+            request['ready_for_pickup'] = False
+        elif request['status'] == 'courier_assigned':
+            request['status_description'] = f"Corredor asignado: {request['courier_first_name']} {request['courier_last_name']}"
+            request['action_available'] = True
+            request['ready_for_pickup'] = True
+        elif request['status'] == 'in_transit':
+            request['status_description'] = 'En tránsito al destino'
+            request['action_available'] = False
+            request['ready_for_pickup'] = False
+    
+    return {
+        "success": True,
+        "accepted_requests": requests,
+        "count": len(requests),
+        "breakdown": {
+            "waiting_courier": len([r for r in requests if r['status'] == 'accepted']),
+            "courier_assigned": len([r for r in requests if r['status'] == 'courier_assigned']),
+            "in_transit": len([r for r in requests if r['status'] == 'in_transit'])
+        }
+    }
+
+
 @app.post("/api/v1/warehouse/accept-request")
 async def accept_transfer_request(
     acceptance: TransferAcceptance,
