@@ -3394,15 +3394,21 @@ async def get_courier_delivery_history(current_user = Depends(get_current_user))
 @app.post("/api/v1/vendor/confirm-reception/{request_id}")
 async def confirm_product_reception(
     request_id: int,
-    received_quantity: int,
-    condition_ok: bool = True,
-    notes: str = "",
+    reception_data: dict,  # Cambiar para recibir JSON body
     current_user = Depends(get_current_user)
 ):
-    """VE008: Confirmar recepción de productos solicitados (actualización automática de inventario)"""
+    """VE008: Confirmar recepción de productos solicitados - VERSIÓN CORREGIDA"""
     
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden confirmar recepción")
+    
+    # Extraer datos del JSON body
+    try:
+        received_quantity = reception_data.get('received_quantity', 1)
+        condition_ok = reception_data.get('condition_ok', True)
+        notes = reception_data.get('notes', "")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Error procesando datos: {str(e)}")
     
     if USE_POSTGRESQL:
         import psycopg2
