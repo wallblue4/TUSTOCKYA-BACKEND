@@ -3465,7 +3465,7 @@ async def confirm_product_reception(
                     cursor.execute('''
                         INSERT INTO products (reference_code, brand, model, color_info, location_name, unit_price, box_price, is_active)
                         SELECT reference_code, brand, model, color_info, 
-                               (SELECT name FROM locations WHERE id = %s), unit_price, box_price, TRUE
+                               (SELECT name FROM locations WHERE id = %s), unit_price, box_price, 1
                         FROM products 
                         WHERE reference_code = %s 
                         LIMIT 1
