@@ -3793,6 +3793,7 @@ async def confirm_product_reception_location_fixed(
         print(f"❌ Error en confirm_reception: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error confirmando recepción: {str(e)}")
     finally:
+        conn.close()
 
 
 @app.get("/api/v1/vendor/pending-receptions")
