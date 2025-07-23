@@ -3392,14 +3392,14 @@ async def get_courier_delivery_history(current_user = Depends(get_current_user))
 # ==================== ENDPOINTS ADICIONALES PARA VENDEDOR ====================
 
 @app.post("/api/v1/vendor/confirm-reception/{request_id}")
-async def confirm_product_reception_fixed(
+async def confirm_product_reception_boolean_fixed(
     request_id: int,
     received_quantity: int = 1,
     condition_ok: bool = True,
     notes: str = "",
     current_user = Depends(get_current_user)
 ):
-    """VE008: Confirmar recepción - VERSIÓN CORREGIDA SIN DUPLICADOS"""
+    """VE008: Confirmar recepción - FIX BOOLEAN vs INTEGER"""
     
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden confirmar recepción")
@@ -3436,7 +3436,6 @@ async def confirm_product_reception_fixed(
     
     try:
         if condition_ok and received_quantity > 0:
-            # ===== LÓGICA CORREGIDA PARA EVITAR DUPLICADOS =====
             
             if USE_POSTGRESQL:
                 # PASO 1: Buscar producto existente en el local del vendedor
@@ -3448,13 +3447,9 @@ async def confirm_product_reception_fixed(
                 ''', (request['sneaker_reference_code'], current_user['location_id']))
                 
                 existing_product = cursor.fetchone()
-                print(f"🔍 Producto existente en local: {existing_product}")
                 
                 if existing_product:
-                    # CASO 1: Producto YA EXISTE en el local - Solo actualizar stock
-                    print(f"✅ Producto existe, actualizando stock...")
-                    
-                    # Verificar si ya existe el size
+                    # CASO 1: Producto YA EXISTE - Solo actualizar stock
                     cursor.execute('''
                         SELECT id, quantity FROM product_sizes 
                         WHERE product_id = %s AND size = %s
@@ -3469,18 +3464,15 @@ async def confirm_product_reception_fixed(
                             SET quantity = quantity + %s
                             WHERE product_id = %s AND size = %s
                         ''', (received_quantity, existing_product['id'], request['size']))
-                        print(f"✅ Stock actualizado: +{received_quantity} para talla {request['size']}")
                     else:
                         # Crear nueva talla para producto existente
                         cursor.execute('''
                             INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
                             VALUES (%s, %s, %s, 0)
                         ''', (existing_product['id'], request['size'], received_quantity))
-                        print(f"✅ Nueva talla creada: {request['size']} con {received_quantity} unidades")
                 
                 else:
-                    # CASO 2: Producto NO EXISTE en este local - Crear producto completo
-                    print(f"🆕 Producto no existe en local, creando...")
+                    # CASO 2: Producto NO EXISTE - Crear producto completo
                     
                     # Buscar información del producto en otros locales
                     cursor.execute('''
@@ -3493,32 +3485,31 @@ async def confirm_product_reception_fixed(
                     source_product = cursor.fetchone()
                     
                     if source_product:
-                        # Crear producto en el local del vendedor
+                        # ✅ FIX: Usar 1 en lugar de TRUE para PostgreSQL
                         cursor.execute('''
                             INSERT INTO products (
                                 reference_code, brand, model, color_info, 
                                 location_name, unit_price, box_price, is_active
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                             RETURNING id
                         ''', (
                             source_product['reference_code'],
                             source_product['brand'], 
                             source_product['model'],
                             source_product['color_info'],
-                            f"Local #{current_user['location_id']}", # Usar nombre genérico
+                            f"Local #{current_user['location_id']}",
                             source_product['unit_price'],
-                            source_product['box_price']
+                            source_product['box_price'],
+                            1  # ✅ FIX: 1 en lugar de TRUE
                         ))
                         
                         new_product_id = cursor.fetchone()[0]
-                        print(f"✅ Producto creado con ID: {new_product_id}")
                         
                         # Crear stock para el nuevo producto
                         cursor.execute('''
                             INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
                             VALUES (%s, %s, %s, 0)
                         ''', (new_product_id, request['size'], received_quantity))
-                        print(f"✅ Stock inicial creado: {received_quantity} unidades talla {request['size']}")
                     
                     else:
                         # Producto no existe en ningún lugar - crear desde datos de transferencia
@@ -3526,15 +3517,16 @@ async def confirm_product_reception_fixed(
                             INSERT INTO products (
                                 reference_code, brand, model, 
                                 location_name, unit_price, box_price, is_active
-                            ) VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                             RETURNING id
                         ''', (
                             request['sneaker_reference_code'],
                             request['brand'],
                             request['model'], 
                             f"Local #{current_user['location_id']}",
-                            0.0,  # Precio por defecto
-                            0.0
+                            0.0,
+                            0.0,
+                            1  # ✅ FIX: 1 en lugar de TRUE
                         ))
                         
                         new_product_id = cursor.fetchone()[0]
@@ -3545,7 +3537,7 @@ async def confirm_product_reception_fixed(
                         ''', (new_product_id, request['size'], received_quantity))
                 
             else:
-                # LÓGICA SIMILAR PARA SQLite
+                # LÓGICA PARA SQLite (usa TRUE/FALSE como boolean)
                 cursor = conn.execute('''
                     SELECT p.id, p.reference_code, p.location_name
                     FROM products p 
@@ -3591,7 +3583,7 @@ async def confirm_product_reception_fixed(
                             INSERT INTO products (
                                 reference_code, brand, model, color_info, 
                                 location_name, unit_price, box_price, is_active
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             source_product['reference_code'],
                             source_product['brand'], 
@@ -3599,7 +3591,8 @@ async def confirm_product_reception_fixed(
                             source_product['color_info'],
                             f"Local #{current_user['location_id']}",
                             source_product['unit_price'],
-                            source_product['box_price']
+                            source_product['box_price'],
+                            1  # Para SQLite también usar 1
                         ))
                         
                         new_product_id = cursor.lastrowid
@@ -3628,7 +3621,6 @@ async def confirm_product_reception_fixed(
                 )
             
             conn.commit()
-            print(f"✅ Transacción completada exitosamente")
             
             return {
                 "success": True,
@@ -3642,10 +3634,6 @@ async def confirm_product_reception_fixed(
                     "brand": request['brand'],
                     "model": request['model'],
                     "size": request['size']
-                },
-                "debug_info": {
-                    "product_existed_in_local": bool(existing_product),
-                    "action_taken": "updated_stock" if existing_product else "created_product"
                 }
             }
             
@@ -3672,7 +3660,7 @@ async def confirm_product_reception_fixed(
             
             return {
                 "success": True,
-                "message": "Recepción registrada con observaciones - Sin actualización de inventario",
+                "message": "Recepción registrada con observaciones",
                 "request_id": request_id,
                 "received_quantity": received_quantity,
                 "inventory_updated": False,
@@ -3686,6 +3674,7 @@ async def confirm_product_reception_fixed(
         raise HTTPException(status_code=500, detail=f"Error confirmando recepción: {str(e)}")
     finally:
         conn.close()
+
 
 @app.get("/api/v1/vendor/pending-receptions")
 async def get_pending_receptions(current_user = Depends(get_current_user)):
