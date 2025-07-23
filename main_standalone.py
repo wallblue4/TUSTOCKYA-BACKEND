@@ -3562,13 +3562,13 @@ async def confirm_product_reception_description_fixed(
                     source_product = cursor.fetchone()
                     
                     if source_product:
-                        # ✅ FIX: Incluir description y otros campos requeridos
+                        # ✅ FIX: Incluir description, created_at y otros campos requeridos
                         cursor.execute('''
                             INSERT INTO products (
                                 reference_code, brand, model, description, color_info, 
                                 location_name, unit_price, box_price, is_active,
-                                video_url, image_url
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                video_url, image_url, created_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             RETURNING id
                         ''', (
                             source_product['reference_code'],
@@ -3581,7 +3581,8 @@ async def confirm_product_reception_description_fixed(
                             source_product['box_price'] or 0.0,
                             1,  # is_active = 1
                             source_product['video_url'],  # Puede ser NULL
-                            source_product['image_url']   # Puede ser NULL
+                            source_product['image_url'],   # Puede ser NULL
+                            timestamp  # ✅ FIX: created_at timestamp
                         ))
                         
                         new_product_id = cursor.fetchone()[0]
@@ -3608,8 +3609,8 @@ async def confirm_product_reception_description_fixed(
                         cursor.execute('''
                             INSERT INTO products (
                                 reference_code, brand, model, description, color_info,
-                                location_name, unit_price, box_price, is_active
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                location_name, unit_price, box_price, is_active, created_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             RETURNING id
                         ''', (
                             request['sneaker_reference_code'],
@@ -3620,7 +3621,8 @@ async def confirm_product_reception_description_fixed(
                             vendor_location_name,
                             180.0,  # Precio por defecto
                             162.0,  # Box price por defecto
-                            1       # is_active = 1
+                            1,      # is_active = 1
+                            timestamp  # ✅ FIX: created_at timestamp
                         ))
                         
                         new_product_id = cursor.fetchone()[0]
@@ -3691,12 +3693,12 @@ async def confirm_product_reception_description_fixed(
                     source_product = cursor.fetchone()
                     
                     if source_product:
-                        # ✅ FIX: Incluir description para SQLite
+                        # ✅ FIX: Incluir description y created_at para SQLite
                         cursor = conn.execute('''
                             INSERT INTO products (
                                 reference_code, brand, model, description, color_info, 
-                                location_name, unit_price, box_price, is_active
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                location_name, unit_price, box_price, is_active, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             source_product['reference_code'],
                             source_product['brand'], 
@@ -3706,7 +3708,8 @@ async def confirm_product_reception_description_fixed(
                             vendor_location_name,
                             source_product['unit_price'] or 0.0,
                             source_product['box_price'] or 0.0,
-                            1
+                            1,
+                            timestamp  # ✅ FIX: created_at timestamp
                         ))
                         
                         new_product_id = cursor.lastrowid
@@ -3731,8 +3734,8 @@ async def confirm_product_reception_description_fixed(
                         cursor = conn.execute('''
                             INSERT INTO products (
                                 reference_code, brand, model, description, color_info,
-                                location_name, unit_price, box_price, is_active
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                location_name, unit_price, box_price, is_active, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             request['sneaker_reference_code'],
                             request['brand'],
@@ -3742,7 +3745,8 @@ async def confirm_product_reception_description_fixed(
                             vendor_location_name,
                             180.0,
                             162.0,
-                            1
+                            1,
+                            timestamp  # ✅ FIX: created_at timestamp
                         ))
                         
                         new_product_id = cursor.lastrowid
