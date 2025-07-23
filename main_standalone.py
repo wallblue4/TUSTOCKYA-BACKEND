@@ -878,6 +878,54 @@ def search_products_in_real_inventory(model_name: str, limit: int = 5):
         print(f"Error buscando en inventario real: {e}")
         return []
 
+
+@app.post("/api/v1/admin/fix-unique-constraint")
+async def fix_unique_constraint(current_user = Depends(get_current_user)):
+    """Corregir constraint UNIQUE problemática"""
+    
+    if current_user['role'] != 'administrador':
+        raise HTTPException(403, "Solo administradores")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        try:
+            # Eliminar constraint problemática
+            cursor.execute('''
+                ALTER TABLE products 
+                DROP CONSTRAINT IF EXISTS products_reference_code_key
+            ''')
+            
+            # Agregar constraint correcta
+            cursor.execute('''
+                ALTER TABLE products 
+                ADD CONSTRAINT products_unique_per_location 
+                UNIQUE (reference_code, location_name)
+            ''')
+            
+            conn.commit()
+            
+            return {
+                "success": True,
+                "message": "Constraint UNIQUE corregida",
+                "change": "reference_code UNIQUE → (reference_code, location_name) UNIQUE",
+                "impact": "Ahora permite mismo producto en diferentes ubicaciones"
+            }
+            
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(500, f"Error: {str(e)}")
+        finally:
+            conn.close()
+    else:
+        # SQLite requiere recrear tabla
+        return {
+            "success": False,
+            "message": "SQLite requiere recrear tabla - usar OPCIÓN B"
+        }
+
 async def call_real_classification_service(image_content: bytes, filename: str):
     """Llamar a tu microservicio real de clasificación"""
     try:
@@ -3472,69 +3520,41 @@ async def confirm_product_reception_boolean_fixed(
                         ''', (existing_product['id'], request['size'], received_quantity))
                 
                 else:
-                    # CASO 2: Producto NO EXISTE - Crear producto completo
-                    
-                    # Buscar información del producto en otros locales
+                    # Crear producto en el local si no existe
+                    # --- INICIO DEL CÓDIGO CORREGIDO PARA POSTGRESQL ---
                     cursor.execute('''
-                        SELECT reference_code, brand, model, color_info, unit_price, box_price
-                        FROM products 
-                        WHERE reference_code = %s 
+                        INSERT INTO products (
+                            reference_code, brand, model, color_info, description,
+                            location_name, unit_price, box_price, is_active,
+                            image_url, created_at, updated_at -- Agregué campos comunes aquí. ¡Ajusta según tu tabla!
+                        )
+                        SELECT
+                            p.reference_code, p.brand, p.model, p.color_info, p.description,
+                            (SELECT name FROM locations WHERE id = %s), p.unit_price, p.box_price, 1, -- '1' para is_active
+                            p.image_url, p.created_at, p.updated_at -- Agregué campos comunes aquí. ¡Ajusta según tu tabla!
+                        FROM products p
+                        WHERE p.reference_code = %s
                         LIMIT 1
-                    ''', (request['sneaker_reference_code'],))
-                    
-                    source_product = cursor.fetchone()
-                    
-                    if source_product:
-                        # ✅ FIX: Usar 1 en lugar de TRUE para PostgreSQL
-                        cursor.execute('''
-                            INSERT INTO products (
-                                reference_code, brand, model, color_info, 
-                                location_name, unit_price, box_price, is_active
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                            RETURNING id
-                        ''', (
-                            source_product['reference_code'],
-                            source_product['brand'], 
-                            source_product['model'],
-                            source_product['color_info'],
-                            f"Local #{current_user['location_id']}",
-                            source_product['unit_price'],
-                            source_product['box_price'],
-                            1  # ✅ FIX: 1 en lugar de TRUE
-                        ))
-                        
-                        new_product_id = cursor.fetchone()[0]
-                        
-                        # Crear stock para el nuevo producto
-                        cursor.execute('''
-                            INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
-                            VALUES (%s, %s, %s, 0)
-                        ''', (new_product_id, request['size'], received_quantity))
-                    
-                    else:
-                        # Producto no existe en ningún lugar - crear desde datos de transferencia
-                        cursor.execute('''
-                            INSERT INTO products (
-                                reference_code, brand, model, 
-                                location_name, unit_price, box_price, is_active
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                            RETURNING id
-                        ''', (
-                            request['sneaker_reference_code'],
-                            request['brand'],
-                            request['model'], 
-                            f"Local #{current_user['location_id']}",
-                            0.0,
-                            0.0,
-                            1  # ✅ FIX: 1 en lugar de TRUE
-                        ))
-                        
-                        new_product_id = cursor.fetchone()[0]
-                        
-                        cursor.execute('''
-                            INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
-                            VALUES (%s, %s, %s, 0)
-                        ''', (new_product_id, request['size'], received_quantity))
+                        RETURNING id
+                    ''', (current_user['location_id'], request['sneaker_reference_code']))
+
+                    new_product_id = cursor.fetchone()['id'] # Usar 'id' porque es RealDictCursor
+                    # --- FIN DEL CÓDIGO CORREGIDO PARA POSTGRESQL ---
+
+                    cursor.execute('''
+                        INSERT INTO product_sizes (product_id, size, quantity, quantity_exhibition)
+                        VALUES (%s, %s, %s, 0)
+                    ''', (new_product_id, request['size'], received_quantity))
+
+                # Marcar solicitud como completada
+                cursor.execute(
+                    '''UPDATE transfer_requests
+                       SET status = 'completed', confirmed_reception_at = %s,
+                           received_quantity = %s, reception_notes = %s
+                       WHERE id = %s''',
+                    (timestamp, received_quantity, notes, request_id)
+                )
+
                 
             else:
                 # LÓGICA PARA SQLite (usa TRUE/FALSE como boolean)
