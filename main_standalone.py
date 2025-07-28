@@ -4457,15 +4457,37 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
     total_value_completed = 0
     
     for transfer in transfers:
-        # Calcular duración total del proceso
-        start_time = datetime.fromisoformat(transfer['requested_at'])
+        # Calcular duración total del proceso - MANEJO ROBUSTO DE FECHAS
+        try:
+            # Verificar que requested_at no sea None y sea string
+            if transfer['requested_at'] and isinstance(transfer['requested_at'], str):
+                start_time = datetime.fromisoformat(transfer['requested_at'])
+            elif transfer['requested_at']:
+                # Si es un objeto datetime, usar directamente
+                start_time = transfer['requested_at'] if isinstance(transfer['requested_at'], datetime) else datetime.now()
+            else:
+                # Si es None, usar timestamp actual
+                start_time = datetime.now()
+        except (ValueError, TypeError) as e:
+            print(f"Error parseando requested_at: {transfer['requested_at']} - {e}")
+            start_time = datetime.now()
         
-        # Determinar tiempo de finalización
-        if transfer['confirmed_reception_at']:
-            end_time = datetime.fromisoformat(transfer['confirmed_reception_at'])
-        elif transfer.get('cancelled_at'):
-            end_time = datetime.fromisoformat(transfer['cancelled_at'])
-        else:
+        # Determinar tiempo de finalización - MANEJO ROBUSTO
+        end_time = datetime.now()  # Default
+        
+        try:
+            if transfer['confirmed_reception_at']:
+                if isinstance(transfer['confirmed_reception_at'], str):
+                    end_time = datetime.fromisoformat(transfer['confirmed_reception_at'])
+                elif isinstance(transfer['confirmed_reception_at'], datetime):
+                    end_time = transfer['confirmed_reception_at']
+            elif transfer.get('cancelled_at'):
+                if isinstance(transfer['cancelled_at'], str):
+                    end_time = datetime.fromisoformat(transfer['cancelled_at'])
+                elif isinstance(transfer['cancelled_at'], datetime):
+                    end_time = transfer['cancelled_at']
+        except (ValueError, TypeError) as e:
+            print(f"Error parseando end_time: {e}")
             end_time = datetime.now()
         
         duration_hours = (end_time - start_time).total_seconds() / 3600
@@ -4510,10 +4532,17 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
             "full_description": f"{transfer['brand']} {transfer['model']} - Talla {transfer['size']}"
         }
         
-        # Información de tiempo
+        # Información de tiempo - MANEJO ROBUSTO DE FECHAS
+        try:
+            requested_time = start_time.strftime("%H:%M")
+            completed_time = end_time.strftime("%H:%M")
+        except (AttributeError, ValueError):
+            requested_time = "N/A"
+            completed_time = "N/A"
+        
         time_info = {
-            "requested_at": start_time.strftime("%H:%M"),
-            "completed_at": end_time.strftime("%H:%M"),
+            "requested_at": requested_time,
+            "completed_at": completed_time,
             "duration": format_duration_simple(duration_hours),
             "duration_hours": round(duration_hours, 1)
         }
@@ -4556,11 +4585,18 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
     total_count = len(processed_transfers)
     success_rate = (completed_count / total_count * 100) if total_count > 0 else 0
     
-    # Promedio de duración solo de las completadas
+    # Promedio de duración solo de las completadas - MANEJO ROBUSTO
+    avg_duration = 0
     if completed_count > 0:
-        avg_duration = sum(t['time_info']['duration_hours'] for t in processed_transfers if t['status'] == 'completed') / completed_count
-    else:
-        avg_duration = 0
+        try:
+            total_duration = sum(
+                t['time_info']['duration_hours'] 
+                for t in processed_transfers 
+                if t['status'] == 'completed' and isinstance(t['time_info']['duration_hours'], (int, float))
+            )
+            avg_duration = total_duration / completed_count if completed_count > 0 else 0
+        except (TypeError, ValueError, ZeroDivisionError):
+            avg_duration = 0
     
     today_stats = {
         "total_transfers": total_count,
@@ -4584,6 +4620,30 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
         "last_updated": datetime.now().isoformat()
     }
 
+
+# ==================== FUNCIÓN AUXILIAR: FORMATEAR DURACIÓN SIMPLE ====================
+
+def format_duration_simple(hours: float) -> str:
+    """Convertir horas a formato legible simple - MANEJO ROBUSTO"""
+    try:
+        # Validar que hours es un número válido
+        if not isinstance(hours, (int, float)) or hours < 0:
+            return "N/A"
+        
+        if hours < 1:
+            minutes = int(hours * 60)
+            return f"{minutes}min"
+        elif hours < 24:
+            return f"{hours:.1f}h"
+        else:
+            days = int(hours // 24)
+            remaining_hours = int(hours % 24)
+            if remaining_hours > 0:
+                return f"{days}d {remaining_hours}h"
+            else:
+                return f"{days}d"
+    except (TypeError, ValueError, ZeroDivisionError):
+        return "N/A"
 
 # ==================== FUNCIÓN AUXILIAR: FORMATEAR DURACIÓN SIMPLE ====================
 
