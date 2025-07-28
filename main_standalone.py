@@ -3900,6 +3900,712 @@ async def get_pending_receptions(current_user = Depends(get_current_user)):
         "urgent_count": len([p for p in pending if p.get('requires_urgent_confirmation', False)])
     }
 
+@app.get("/api/v1/vendor/pending-transfers")
+async def get_pending_transfers(current_user = Depends(get_current_user)):
+    """
+    VE003 Extendido: Ver todas las solicitudes de transferencia que no han finalizado
+    
+    Estados considerados como "pendientes":
+    - pending: Esperando aceptación del bodeguero
+    - accepted: Aceptada por bodeguero, esperando corredor
+    - courier_assigned: Corredor asignado, esperando recolección
+    - in_transit: En camino al destino
+    - delivered: Entregada, esperando confirmación del vendedor
+    
+    Estados NO incluidos (finalizados):
+    - completed: Confirmada por vendedor (finalizada exitosamente)
+    - cancelled: Cancelada
+    - delivery_failed: Entrega fallida
+    - reception_issues: Problemas en recepción
+    """
+    
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo vendedores pueden ver sus transferencias pendientes")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute('''
+            SELECT tr.*, 
+                   sl.name as source_location_name,
+                   sl.address as source_address,
+                   sl.phone as source_phone,
+                   dl.name as destination_location_name,
+                   dl.address as destination_address,
+                   wk.first_name as warehouse_keeper_first_name,
+                   wk.last_name as warehouse_keeper_last_name,
+                   c.first_name as courier_first_name,
+                   c.last_name as courier_last_name,
+                   c.email as courier_email,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.color_info as product_color
+            FROM transfer_requests tr
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+            LEFT JOIN users c ON tr.courier_id = c.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND p.location_name = sl.name)
+            WHERE tr.requester_id = %s 
+            AND tr.status IN ('pending', 'accepted', 'courier_assigned', 'in_transit', 'delivered')
+            ORDER BY 
+                CASE tr.status 
+                    WHEN 'pending' THEN 1 
+                    WHEN 'accepted' THEN 2 
+                    WHEN 'courier_assigned' THEN 3 
+                    WHEN 'in_transit' THEN 4 
+                    WHEN 'delivered' THEN 5 
+                END,
+                tr.requested_at DESC
+        ''', (current_user['id'],))
+        transfers = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute('''
+            SELECT tr.*, 
+                   sl.name as source_location_name,
+                   sl.address as source_address,
+                   sl.phone as source_phone,
+                   dl.name as destination_location_name,
+                   dl.address as destination_address,
+                   wk.first_name as warehouse_keeper_first_name,
+                   wk.last_name as warehouse_keeper_last_name,
+                   c.first_name as courier_first_name,
+                   c.last_name as courier_last_name,
+                   c.email as courier_email,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.color_info as product_color
+            FROM transfer_requests tr
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+            LEFT JOIN users c ON tr.courier_id = c.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND p.location_name = sl.name)
+            WHERE tr.requester_id = ? 
+            AND tr.status IN ("pending", "accepted", "courier_assigned", "in_transit", "delivered")
+            ORDER BY 
+                CASE tr.status 
+                    WHEN "pending" THEN 1 
+                    WHEN "accepted" THEN 2 
+                    WHEN "courier_assigned" THEN 3 
+                    WHEN "in_transit" THEN 4 
+                    WHEN "delivered" THEN 5 
+                END,
+                tr.requested_at DESC
+        ''', (current_user['id'],))
+        transfers = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    # Procesar cada transferencia para agregar información detallada del estado
+    for transfer in transfers:
+        # Calcular tiempos transcurridos
+        now = datetime.now()
+        
+        # Tiempo desde solicitud
+        if transfer['requested_at']:
+            try:
+                requested_time = datetime.fromisoformat(transfer['requested_at'])
+                hours_since_request = (now - requested_time).total_seconds() / 3600
+                transfer['hours_since_request'] = round(hours_since_request, 1)
+                transfer['days_since_request'] = round(hours_since_request / 24, 1)
+            except:
+                transfer['hours_since_request'] = 0
+                transfer['days_since_request'] = 0
+        else:
+            transfer['hours_since_request'] = 0
+            transfer['days_since_request'] = 0
+        
+        # Tiempo en estado actual
+        last_update = None
+        if transfer['delivered_at']:
+            last_update = transfer['delivered_at']
+        elif transfer['picked_up_at']:
+            last_update = transfer['picked_up_at']
+        elif transfer['accepted_at']:
+            last_update = transfer['accepted_at']
+        else:
+            last_update = transfer['requested_at']
+        
+        if last_update:
+            try:
+                last_update_time = datetime.fromisoformat(last_update)
+                hours_in_current_state = (now - last_update_time).total_seconds() / 3600
+                transfer['hours_in_current_state'] = round(hours_in_current_state, 1)
+            except:
+                transfer['hours_in_current_state'] = 0
+        else:
+            transfer['hours_in_current_state'] = 0
+        
+        # Estado detallado y acción requerida
+        status = transfer['status']
+        
+        if status == 'pending':
+            transfer['status_info'] = {
+                "status": "pending",
+                "title": "🕐 Esperando Bodeguero",
+                "description": f"Solicitud enviada a {transfer['source_location_name']}",
+                "detail": "El bodeguero debe revisar y aceptar la solicitud",
+                "action_required": None,
+                "next_step": "Esperar respuesta del bodeguero",
+                "estimated_time": "5-30 minutos",
+                "urgency": "high" if transfer['purpose'] == 'cliente' else "normal",
+                "can_cancel": True,
+                "progress_percentage": 10
+            }
+        
+        elif status == 'accepted':
+            transfer['status_info'] = {
+                "status": "accepted",
+                "title": "✅ Aceptada - Buscando Corredor",
+                "description": f"Aceptada por {transfer['warehouse_keeper_first_name'] or 'bodeguero'}",
+                "detail": "Esperando que un corredor acepte el transporte",
+                "action_required": None,
+                "next_step": "Un corredor tomará la solicitud",
+                "estimated_time": "10-60 minutos",
+                "urgency": "high" if transfer['purpose'] == 'cliente' else "normal",
+                "can_cancel": True,
+                "progress_percentage": 30,
+                "warehouse_keeper": f"{transfer['warehouse_keeper_first_name'] or ''} {transfer['warehouse_keeper_last_name'] or ''}".strip()
+            }
+        
+        elif status == 'courier_assigned':
+            courier_name = f"{transfer['courier_first_name'] or ''} {transfer['courier_last_name'] or ''}".strip()
+            transfer['status_info'] = {
+                "status": "courier_assigned",
+                "title": "🚚 Corredor Asignado",
+                "description": f"Corredor {courier_name} va a recoger",
+                "detail": f"El corredor se dirige a {transfer['source_location_name']}",
+                "action_required": None,
+                "next_step": "Corredor recogerá el producto",
+                "estimated_time": f"{transfer.get('estimated_pickup_time', 30)} minutos",
+                "urgency": "medium",
+                "can_cancel": False,
+                "progress_percentage": 50,
+                "courier_info": {
+                    "name": courier_name,
+                    "email": transfer['courier_email'],
+                    "estimated_pickup": transfer.get('estimated_pickup_time', 30)
+                }
+            }
+        
+        elif status == 'in_transit':
+            courier_name = f"{transfer['courier_first_name'] or ''} {transfer['courier_last_name'] or ''}".strip()
+            transfer['status_info'] = {
+                "status": "in_transit",
+                "title": "🚛 En Camino",
+                "description": f"Producto recogido, en tránsito contigo",
+                "detail": f"Corredor {courier_name} viene hacia tu local",
+                "action_required": None,
+                "next_step": "Esperar llegada del corredor",
+                "estimated_time": "15-45 minutos",
+                "urgency": "medium",
+                "can_cancel": False,
+                "progress_percentage": 75,
+                "courier_info": {
+                    "name": courier_name,
+                    "email": transfer['courier_email'],
+                    "picked_up_at": transfer['picked_up_at']
+                }
+            }
+        
+        elif status == 'delivered':
+            transfer['status_info'] = {
+                "status": "delivered",
+                "title": "📦 Entregado - Confirma Recepción",
+                "description": "Producto entregado en tu local",
+                "detail": "Debes confirmar que recibiste el producto en buen estado",
+                "action_required": "confirm_reception",
+                "next_step": "Confirmar recepción del producto",
+                "estimated_time": "Inmediato",
+                "urgency": "high",
+                "can_cancel": False,
+                "progress_percentage": 90,
+                "delivered_at": transfer['delivered_at'],
+                "action_url": f"/api/v1/vendor/confirm-reception/{transfer['id']}"
+            }
+        
+        # Información del producto con imagen fallback
+        transfer['product_info'] = {
+            "reference_code": transfer['sneaker_reference_code'],
+            "brand": transfer['brand'],
+            "model": transfer['model'],
+            "size": transfer['size'],
+            "quantity": transfer['quantity'],
+            "color": transfer['product_color'] or "Varios",
+            "price": float(transfer['product_price']) if transfer['product_price'] else 0.0,
+            "image": transfer['product_image'] or f"https://via.placeholder.com/300x200?text={transfer['brand']}+{transfer['model']}",
+            "full_description": f"{transfer['brand']} {transfer['model']} - Talla {transfer['size']} ({transfer['quantity']} unidad{'es' if transfer['quantity'] > 1 else ''})"
+        }
+        
+        # Información de ubicaciones
+        transfer['location_info'] = {
+            "from": {
+                "name": transfer['source_location_name'],
+                "address": transfer['source_address'] or "Dirección no disponible",
+                "phone": transfer['source_phone']
+            },
+            "to": {
+                "name": transfer['destination_location_name'],
+                "address": transfer['destination_address'] or "Dirección no disponible"
+            }
+        }
+        
+        # Información del propósito
+        transfer['purpose_info'] = {
+            "purpose": transfer['purpose'],
+            "description": "🔥 Cliente presente esperando" if transfer['purpose'] == 'cliente' else "📦 Restock para inventario",
+            "priority": "Alta" if transfer['purpose'] == 'cliente' else "Normal",
+            "destination_type": transfer['destination_type'],
+            "storage_location": "Exhibición" if transfer['destination_type'] == 'exhibicion' else "Bodega"
+        }
+        
+        # Timeline de la transferencia
+        timeline = []
+        
+        timeline.append({
+            "step": "requested",
+            "title": "Solicitud Creada",
+            "timestamp": transfer['requested_at'],
+            "completed": True,
+            "description": f"Solicitaste producto de {transfer['source_location_name']}"
+        })
+        
+        if transfer['accepted_at']:
+            timeline.append({
+                "step": "accepted",
+                "title": "Aceptada por Bodeguero",
+                "timestamp": transfer['accepted_at'],
+                "completed": True,
+                "description": f"Aceptada por {transfer['warehouse_keeper_first_name'] or 'bodeguero'}"
+            })
+        
+        if transfer['courier_id']:
+            timeline.append({
+                "step": "courier_assigned",
+                "title": "Corredor Asignado",
+                "timestamp": transfer.get('courier_accepted_at'),
+                "completed": True,
+                "description": f"Corredor {courier_name} asignado"
+            })
+        
+        if transfer['picked_up_at']:
+            timeline.append({
+                "step": "picked_up",
+                "title": "Producto Recogido",
+                "timestamp": transfer['picked_up_at'],
+                "completed": True,
+                "description": "Producto recogido, en tránsito"
+            })
+        
+        if transfer['delivered_at']:
+            timeline.append({
+                "step": "delivered",
+                "title": "Producto Entregado",
+                "timestamp": transfer['delivered_at'],
+                "completed": True,
+                "description": "Entregado en tu local, pendiente confirmación"
+            })
+        
+        timeline.append({
+            "step": "completed",
+            "title": "Recepción Confirmada",
+            "timestamp": None,
+            "completed": False,
+            "description": "Confirmar recepción y actualizar inventario"
+        })
+        
+        transfer['timeline'] = timeline
+    
+    # Estadísticas de resumen
+    total_transfers = len(transfers)
+    status_breakdown = {}
+    urgency_breakdown = {"high": 0, "medium": 0, "normal": 0}
+    purpose_breakdown = {"cliente": 0, "restock": 0}
+    
+    for transfer in transfers:
+        # Contar por estado
+        status = transfer['status']
+        status_breakdown[status] = status_breakdown.get(status, 0) + 1
+        
+        # Contar por urgencia
+        urgency = transfer['status_info']['urgency']
+        urgency_breakdown[urgency] += 1
+        
+        # Contar por propósito
+        purpose = transfer['purpose']
+        purpose_breakdown[purpose] += 1
+    
+    # Detectar transferencias que requieren atención
+    attention_needed = []
+    for transfer in transfers:
+        if transfer['status_info'].get('action_required'):
+            attention_needed.append({
+                "transfer_id": transfer['id'],
+                "action": transfer['status_info']['action_required'],
+                "urgency": transfer['status_info']['urgency'],
+                "description": transfer['status_info']['description']
+            })
+        
+        # Transferencias que llevan mucho tiempo
+        if transfer['hours_in_current_state'] > 24:  # Más de 24 horas en el mismo estado
+            attention_needed.append({
+                "transfer_id": transfer['id'],
+                "action": "review_delay",
+                "urgency": "high",
+                "description": f"Lleva {transfer['hours_in_current_state']:.1f} horas en estado '{transfer['status']}'"
+            })
+    
+    return {
+        "success": True,
+        "pending_transfers": transfers,
+        "summary": {
+            "total_pending": total_transfers,
+            "attention_needed": len(attention_needed),
+            "status_breakdown": status_breakdown,
+            "urgency_breakdown": urgency_breakdown,
+            "purpose_breakdown": purpose_breakdown
+        },
+        "attention_needed": attention_needed,
+        "vendor_info": {
+            "name": f"{current_user['first_name']} {current_user['last_name']}",
+            "location_id": current_user['location_id'],
+            "location_name": f"Local #{current_user['location_id']}"
+        },
+        "last_updated": datetime.now().isoformat(),
+        "refresh_interval": 30  # Sugerencia de refresco cada 30 segundos
+    }
+
+
+# ==================== ENDPOINT ADICIONAL: CANCELAR TRANSFERENCIA ====================
+
+@app.post("/api/v1/vendor/cancel-transfer/{transfer_id}")
+async def cancel_transfer_request(
+    transfer_id: int,
+    cancellation_reason: str = "Cancelada por vendedor",
+    current_user = Depends(get_current_user)
+):
+    """
+    Cancelar una solicitud de transferencia (solo si está en estado pending o accepted)
+    """
+    
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo vendedores pueden cancelar sus transferencias")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Verificar que la transferencia pertenece al usuario y puede cancelarse
+        cursor.execute(
+            '''SELECT status FROM transfer_requests 
+               WHERE id = %s AND requester_id = %s AND status IN ('pending', 'accepted')''',
+            (transfer_id, current_user['id'])
+        )
+        transfer = cursor.fetchone()
+        
+        if not transfer:
+            conn.close()
+            raise HTTPException(
+                status_code=400, 
+                detail="No se puede cancelar: transferencia no encontrada, no es tuya, o ya está en proceso"
+            )
+        
+        # Cancelar transferencia
+        timestamp = datetime.now().isoformat()
+        cursor.execute(
+            '''UPDATE transfer_requests 
+               SET status = 'cancelled', notes = %s, cancelled_at = %s
+               WHERE id = %s''',
+            (f"Cancelada: {cancellation_reason}", timestamp, transfer_id)
+        )
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        
+        cursor = conn.execute(
+            '''SELECT status FROM transfer_requests 
+               WHERE id = ? AND requester_id = ? AND status IN ("pending", "accepted")''',
+            (transfer_id, current_user['id'])
+        )
+        transfer = cursor.fetchone()
+        
+        if not transfer:
+            conn.close()
+            raise HTTPException(
+                status_code=400, 
+                detail="No se puede cancelar: transferencia no encontrada, no es tuya, o ya está en proceso"
+            )
+        
+        timestamp = datetime.now().isoformat()
+        conn.execute(
+            '''UPDATE transfer_requests 
+               SET status = "cancelled", notes = ?, cancelled_at = ?
+               WHERE id = ?''',
+            (f"Cancelada: {cancellation_reason}", timestamp, transfer_id)
+        )
+    
+    conn.commit()
+    conn.close()
+    
+    return {
+        "success": True,
+        "message": "Transferencia cancelada exitosamente",
+        "transfer_id": transfer_id,
+        "cancelled_at": timestamp,
+        "reason": cancellation_reason
+    }
+
+# ==================== ENDPOINT: TRANSFERENCIAS COMPLETADAS DEL DÍA ====================
+
+@app.get("/api/v1/vendor/completed-transfers")
+async def get_completed_transfers_today(current_user = Depends(get_current_user)):
+    """
+    Transferencias completadas y canceladas del día actual
+    
+    Estados incluidos:
+    - completed: Confirmada por vendedor (exitosa)
+    - cancelled: Cancelada en cualquier punto del proceso
+    
+    Solo muestra transferencias del día actual (hoy)
+    """
+    
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo vendedores pueden ver sus transferencias completadas")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute('''
+            SELECT tr.*, 
+                   sl.name as source_location_name,
+                   sl.address as source_address,
+                   dl.name as destination_location_name,
+                   wk.first_name as warehouse_keeper_first_name,
+                   wk.last_name as warehouse_keeper_last_name,
+                   c.first_name as courier_first_name,
+                   c.last_name as courier_last_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.color_info as product_color
+            FROM transfer_requests tr
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+            LEFT JOIN users c ON tr.courier_id = c.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND p.location_name = sl.name)
+            WHERE tr.requester_id = %s 
+            AND tr.status IN ('completed', 'cancelled')
+            AND DATE(tr.requested_at) = CURRENT_DATE
+            ORDER BY 
+                CASE tr.status WHEN 'completed' THEN 1 WHEN 'cancelled' THEN 2 END,
+                tr.requested_at DESC
+        ''', (current_user['id'],))
+        
+        transfers = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute('''
+            SELECT tr.*, 
+                   sl.name as source_location_name,
+                   sl.address as source_address,
+                   dl.name as destination_location_name,
+                   wk.first_name as warehouse_keeper_first_name,
+                   wk.last_name as warehouse_keeper_last_name,
+                   c.first_name as courier_first_name,
+                   c.last_name as courier_last_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.color_info as product_color
+            FROM transfer_requests tr
+            JOIN locations sl ON tr.source_location_id = sl.id
+            JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
+            LEFT JOIN users c ON tr.courier_id = c.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND p.location_name = sl.name)
+            WHERE tr.requester_id = ? 
+            AND tr.status IN ("completed", "cancelled")
+            AND DATE(tr.requested_at) = DATE('now')
+            ORDER BY 
+                CASE tr.status WHEN "completed" THEN 1 WHEN "cancelled" THEN 2 END,
+                tr.requested_at DESC
+        ''', (current_user['id'],))
+        
+        transfers = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    # Procesar cada transferencia
+    processed_transfers = []
+    completed_count = 0
+    cancelled_count = 0
+    total_value_completed = 0
+    
+    for transfer in transfers:
+        # Calcular duración total del proceso
+        start_time = datetime.fromisoformat(transfer['requested_at'])
+        
+        # Determinar tiempo de finalización
+        if transfer['confirmed_reception_at']:
+            end_time = datetime.fromisoformat(transfer['confirmed_reception_at'])
+        elif transfer.get('cancelled_at'):
+            end_time = datetime.fromisoformat(transfer['cancelled_at'])
+        else:
+            end_time = datetime.now()
+        
+        duration_hours = (end_time - start_time).total_seconds() / 3600
+        
+        # Información del resultado según el estado
+        status = transfer['status']
+        
+        if status == 'completed':
+            completed_count += 1
+            result_info = {
+                "result": "success",
+                "title": "✅ Completada",
+                "description": "Transferencia exitosa, producto agregado al inventario",
+                "color": "green",
+                "icon": "✅"
+            }
+            # Sumar valor solo de las completadas
+            product_value = float(transfer['product_price'] or 0) * transfer['quantity']
+            total_value_completed += product_value
+        else:  # cancelled
+            cancelled_count += 1
+            result_info = {
+                "result": "cancelled",
+                "title": "❌ Cancelada",
+                "description": "Transferencia cancelada",
+                "color": "red",
+                "icon": "❌"
+            }
+            product_value = 0
+        
+        # Información del producto
+        product_info = {
+            "reference_code": transfer['sneaker_reference_code'],
+            "brand": transfer['brand'],
+            "model": transfer['model'],
+            "size": transfer['size'],
+            "quantity": transfer['quantity'],
+            "color": transfer['product_color'] or "Varios",
+            "price": float(transfer['product_price']) if transfer['product_price'] else 0.0,
+            "total_value": product_value,
+            "image": transfer['product_image'] or f"https://via.placeholder.com/200x150?text={transfer['brand']}+{transfer['model']}",
+            "full_description": f"{transfer['brand']} {transfer['model']} - Talla {transfer['size']}"
+        }
+        
+        # Información de tiempo
+        time_info = {
+            "requested_at": start_time.strftime("%H:%M"),
+            "completed_at": end_time.strftime("%H:%M"),
+            "duration": format_duration_simple(duration_hours),
+            "duration_hours": round(duration_hours, 1)
+        }
+        
+        # Ubicaciones
+        locations = {
+            "from": transfer['source_location_name'],
+            "to": transfer['destination_location_name']
+        }
+        
+        # Participantes
+        participants = {
+            "warehouse_keeper": f"{transfer['warehouse_keeper_first_name'] or ''} {transfer['warehouse_keeper_last_name'] or ''}".strip() or "No asignado",
+            "courier": f"{transfer['courier_first_name'] or ''} {transfer['courier_last_name'] or ''}".strip() or "No asignado"
+        }
+        
+        # Propósito
+        purpose_info = {
+            "type": transfer['purpose'],
+            "description": "🔥 Cliente presente" if transfer['purpose'] == 'cliente' else "📦 Restock",
+            "urgent": transfer['purpose'] == 'cliente'
+        }
+        
+        processed_transfer = {
+            "id": transfer['id'],
+            "status": status,
+            "result_info": result_info,
+            "product_info": product_info,
+            "time_info": time_info,
+            "locations": locations,
+            "participants": participants,
+            "purpose": purpose_info,
+            "notes": transfer.get('notes'),
+            "reception_notes": transfer.get('reception_notes')
+        }
+        
+        processed_transfers.append(processed_transfer)
+    
+    # Estadísticas del día
+    total_count = len(processed_transfers)
+    success_rate = (completed_count / total_count * 100) if total_count > 0 else 0
+    
+    # Promedio de duración solo de las completadas
+    if completed_count > 0:
+        avg_duration = sum(t['time_info']['duration_hours'] for t in processed_transfers if t['status'] == 'completed') / completed_count
+    else:
+        avg_duration = 0
+    
+    today_stats = {
+        "total_transfers": total_count,
+        "completed": completed_count,
+        "cancelled": cancelled_count,
+        "success_rate": round(success_rate, 1),
+        "total_value_completed": round(total_value_completed, 2),
+        "average_duration": format_duration_simple(avg_duration),
+        "performance": "Excelente" if success_rate > 90 else "Buena" if success_rate > 75 else "Regular" if success_rate > 50 else "Baja"
+    }
+    
+    return {
+        "success": True,
+        "date": datetime.now().date().isoformat(),
+        "completed_transfers": processed_transfers,
+        "today_stats": today_stats,
+        "vendor_info": {
+            "name": f"{current_user['first_name']} {current_user['last_name']}",
+            "location_id": current_user['location_id']
+        },
+        "last_updated": datetime.now().isoformat()
+    }
+
+
+# ==================== FUNCIÓN AUXILIAR: FORMATEAR DURACIÓN SIMPLE ====================
+
+def format_duration_simple(hours: float) -> str:
+    """Convertir horas a formato legible simple"""
+    if hours < 1:
+        minutes = int(hours * 60)
+        return f"{minutes}min"
+    elif hours < 24:
+        return f"{hours:.1f}h"
+    else:
+        days = int(hours // 24)
+        remaining_hours = int(hours % 24)
+        if remaining_hours > 0:
+            return f"{days}d {remaining_hours}h"
+        else:
+            return f"{days}d"
+
+
+
+
+
 @app.post("/api/v1/vendor/confirm-reception-debug/{request_id}")
 async def confirm_product_reception_debug(
     request_id: int,
