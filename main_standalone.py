@@ -959,241 +959,322 @@ async def call_real_classification_service(image_content: bytes, filename: str):
 
 def merge_classification_with_inventory(classification_result, user_location_id):
     """
-    Versión mejorada que incluye información completa de ubicaciones
+    Versión mejorada con mejor manejo de errores
     """
     if not classification_result or not classification_result.get('results'):
+        print("⚠️ [DEBUG] No classification results to process")
         return []
     
     merged_results = []
     
-    for rank, result in enumerate(classification_result['results'][:3], 1):
-        model_name = result.get('model_name', '')
-        brand = result.get('brand', '')
+    try:
+        for rank, result in enumerate(classification_result['results'][:3], 1):
+            model_name = result.get('model_name', '')
+            brand = result.get('brand', 'Unknown')
+            
+            print(f"🔍 [DEBUG] Processing result {rank}: brand='{brand}', model='{model_name}'")
+            
+            # ✅ FIX: Validar datos antes de buscar
+            if not brand or brand == 'Unknown':
+                print(f"⚠️ [DEBUG] Skipping result {rank} - invalid brand")
+                continue
+                
+            if not model_name:
+                print(f"⚠️ [DEBUG] Using brand as fallback for model in result {rank}")
+                model_name = brand
+            
+            # Buscar en todas las ubicaciones
+            try:
+                all_locations = find_all_locations_with_product(
+                    reference_code=None,  # Búsqueda por similitud
+                    brand=brand,
+                    model=model_name
+                )
+                
+                print(f"✅ [DEBUG] Found {len(all_locations)} locations for result {rank}")
+                
+            except Exception as search_error:
+                print(f"❌ [ERROR] Error searching locations for result {rank}: {search_error}")
+                all_locations = []
+            
+            # Si no se encontraron ubicaciones, crear resultado básico
+            if not all_locations:
+                print(f"⚠️ [DEBUG] No locations found for result {rank}, creating fallback")
+                
+                fallback_result = {
+                    "rank": rank,
+                    "similarity_score": result.get('similarity_score', 0.0),
+                    "confidence_percentage": result.get('confidence_percentage', 0.0),
+                    "confidence_level": result.get('confidence_level', 'low'),
+                    "reference": {
+                        "code": f"NOT-FOUND-{rank:03d}",
+                        "brand": brand,
+                        "model": model_name,
+                        "color": result.get('color', 'Varios'),
+                        "description": f"{brand} {model_name}",
+                        "photo": f"https://via.placeholder.com/300x300?text={brand.replace(' ', '+')}+{model_name.replace(' ', '+')}"
+                    },
+                    "availability": {
+                        "summary": {
+                            "current_location": {"has_stock": False, "total_stock": 0, "available_sizes": [], "locations_count": 0},
+                            "other_locations": {"has_stock": False, "total_stock": 0, "additional_sizes": [], "locations_count": 0, "can_request_transfer": False},
+                            "total_system": {"total_stock": 0, "total_locations": 0, "all_available_sizes": []}
+                        },
+                        "recommended_action": "❌ Producto no encontrado en inventario",
+                        "action_type": "not_in_inventory",
+                        "can_sell_now": False,
+                        "can_request_transfer": False
+                    },
+                    "locations": {
+                        "current_location": [],
+                        "other_locations": [],
+                        "total_locations_found": 0
+                    },
+                    "pricing": {
+                        "unit_price": 0.0,
+                        "box_price": 0.0,
+                        "has_pricing": False
+                    },
+                    "classification_source": "real_microservice",
+                    "inventory_source": "not_found",
+                    "original_db_id": result.get('original_db_id'),
+                    "image_path": result.get('image_path')
+                }
+                
+                merged_results.append(fallback_result)
+                continue
+            
+            # Separar ubicación actual vs otras
+            try:
+                current_location, other_locations = separate_locations_by_user(all_locations, user_location_id)
+                availability_summary = calculate_availability_summary(current_location, other_locations)
+                
+                # Determinar acción recomendada
+                if availability_summary['current_location']['has_stock']:
+                    recommended_action = "✅ Disponible para venta inmediata"
+                    action_type = "sell_immediately"
+                elif availability_summary['other_locations']['has_stock']:
+                    locations_count = availability_summary['other_locations']['locations_count']
+                    recommended_action = f"📦 Solicitar transferencia ({locations_count} ubicación{'es' if locations_count > 1 else ''} disponible{'s' if locations_count > 1 else ''})"
+                    action_type = "request_transfer"
+                else:
+                    recommended_action = "❌ Sin stock en el sistema"
+                    action_type = "out_of_stock"
+                
+                # Construir resultado completo
+                enhanced_result = {
+                    "rank": rank,
+                    "similarity_score": result.get('similarity_score', 0.0),
+                    "confidence_percentage": result.get('confidence_percentage', 0.0),
+                    "confidence_level": result.get('confidence_level', 'low'),
+                    "reference": {
+                        "code": current_location[0]['product_info']['reference_code'] if current_location else f"SEARCH-{rank:03d}",
+                        "brand": brand,
+                        "model": model_name,
+                        "color": current_location[0]['product_info']['color'] if current_location else result.get('color', 'Varios'),
+                        "description": f"{brand} {model_name}",
+                        "photo": current_location[0]['product_info']['image_url'] if current_location else f"https://via.placeholder.com/300x300?text={brand.replace(' ', '+')}+{model_name.replace(' ', '+')}"
+                    },
+                    "availability": {
+                        "summary": availability_summary,
+                        "recommended_action": recommended_action,
+                        "action_type": action_type,
+                        "can_sell_now": availability_summary['current_location']['has_stock'],
+                        "can_request_transfer": availability_summary['other_locations']['can_request_transfer']
+                    },
+                    "locations": {
+                        "current_location": current_location,
+                        "other_locations": other_locations,
+                        "total_locations_found": len(all_locations)
+                    },
+                    "pricing": {
+                        "unit_price": current_location[0]['product_info']['unit_price'] if current_location else 0.0,
+                        "box_price": current_location[0]['product_info']['box_price'] if current_location else 0.0,
+                        "has_pricing": len(current_location) > 0
+                    },
+                    "classification_source": "real_microservice",
+                    "inventory_source": "enhanced_multi_location",
+                    "original_db_id": result.get('original_db_id'),
+                    "image_path": result.get('image_path')
+                }
+                
+                merged_results.append(enhanced_result)
+                
+                print(f"✅ [DEBUG] Processed result {rank}: {availability_summary['total_system']['total_locations']} ubicaciones, {availability_summary['total_system']['total_stock']} unidades")
+                
+            except Exception as process_error:
+                print(f"❌ [ERROR] Error processing locations for result {rank}: {process_error}")
+                continue
         
-        print(f"🔍 Buscando ubicaciones para: {brand} {model_name}")
+        print(f"✅ [DEBUG] Final merged_results count: {len(merged_results)}")
+        return merged_results
         
-        # Buscar en todas las ubicaciones
-        all_locations = find_all_locations_with_product(
-            reference_code=None,  # Búsqueda por similitud
-            brand=brand,
-            model=model_name
-        )
-        
-        # Separar ubicación actual vs otras
-        current_location, other_locations = separate_locations_by_user(all_locations, user_location_id)
-        
-        # Calcular resumen de disponibilidad
-        availability_summary = calculate_availability_summary(current_location, other_locations)
-        
-        # Determinar acción recomendada
-        if availability_summary['current_location']['has_stock']:
-            recommended_action = "✅ Disponible para venta inmediata"
-            action_type = "sell_immediately"
-        elif availability_summary['other_locations']['has_stock']:
-            locations_count = availability_summary['other_locations']['locations_count']
-            recommended_action = f"📦 Solicitar transferencia ({locations_count} ubicación{'es' if locations_count > 1 else ''} disponible{'s' if locations_count > 1 else ''})"
-            action_type = "request_transfer"
-        else:
-            recommended_action = "❌ Sin stock en el sistema"
-            action_type = "out_of_stock"
-        
-        # Construir resultado mejorado
-        enhanced_result = {
-            "rank": rank,
-            "similarity_score": result.get('similarity_score', 0.0),
-            "confidence_percentage": result.get('confidence_percentage', 0.0),
-            "confidence_level": result.get('confidence_level', 'low'),
-            "reference": {
-                "code": current_location[0]['product_info']['reference_code'] if current_location else f"SEARCH-{rank:03d}",
-                "brand": brand,
-                "model": model_name,
-                "color": current_location[0]['product_info']['color'] if current_location else result.get('color', 'Varios'),
-                "description": f"{brand} {model_name}",
-                "photo": current_location[0]['product_info']['image_url'] if current_location else f"https://via.placeholder.com/300x300?text={brand.replace(' ', '+')}+{model_name.replace(' ', '+')}"
-            },
-            "availability": {
-                "summary": availability_summary,
-                "recommended_action": recommended_action,
-                "action_type": action_type,
-                "can_sell_now": availability_summary['current_location']['has_stock'],
-                "can_request_transfer": availability_summary['other_locations']['can_request_transfer']
-            },
-            "locations": {
-                "current_location": current_location,
-                "other_locations": other_locations,
-                "total_locations_found": len(all_locations)
-            },
-            "pricing": {
-                "unit_price": current_location[0]['product_info']['unit_price'] if current_location else 0.0,
-                "box_price": current_location[0]['product_info']['box_price'] if current_location else 0.0,
-                "has_pricing": len(current_location) > 0
-            },
-            "classification_source": "real_microservice",
-            "inventory_source": "enhanced_multi_location",
-            "original_db_id": result.get('original_db_id'),
-            "image_path": result.get('image_path')
-        }
-        
-        merged_results.append(enhanced_result)
-        
-        print(f"✅ Resultado {rank}: {availability_summary['total_system']['total_locations']} ubicaciones, {availability_summary['total_system']['total_stock']} unidades")
-    
-    return merged_results
+    except Exception as e:
+        print(f"❌ [ERROR] merge_classification_with_inventory_enhanced: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 def find_all_locations_with_product(reference_code: str, brand: str = None, model: str = None, size: str = None):
     """
-    Encontrar todas las ubicaciones que tienen un producto específico disponible
-    
-    Args:
-        reference_code: Código de referencia del producto
-        brand: Marca del producto (opcional, para búsqueda por similitud)
-        model: Modelo del producto (opcional, para búsqueda por similitud)
-        size: Talla específica (opcional, si no se especifica busca todas)
-    
-    Returns:
-        Lista de ubicaciones con stock disponible
+    Encontrar todas las ubicaciones que tienen un producto específico disponible - VERSIÓN CORREGIDA
     """
     
-    if USE_POSTGRESQL:
-        import psycopg2
-        import psycopg2.extras
-        conn = psycopg2.connect(DB_PATH)
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        if USE_POSTGRESQL:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # ✅ FIX: Usar 1 en lugar de TRUE para PostgreSQL
+            base_query = '''
+                SELECT p.reference_code, p.brand, p.model, p.description,
+                       p.color_info, p.unit_price, p.box_price, p.image_url,
+                       ps.size, ps.quantity, ps.quantity_exhibition,
+                       l.id as location_id, l.name as location_name,
+                       l.type as location_type, l.address as location_address
+                FROM products p
+                JOIN product_sizes ps ON p.id = ps.product_id
+                JOIN locations l ON p.location_name = l.name
+                WHERE ps.quantity > 0 AND p.is_active = 1
+            '''
+            
+            params = []
+            
+            if reference_code:
+                base_query += " AND p.reference_code = %s"
+                params.append(reference_code)
+            elif brand and model:
+                base_query += " AND (p.brand ILIKE %s AND p.model ILIKE %s)"
+                params.extend([f'%{brand}%', f'%{model}%'])
+            elif brand:
+                base_query += " AND p.brand ILIKE %s"
+                params.append(f'%{brand}%')
+            
+            if size:
+                base_query += " AND ps.size = %s"
+                params.append(size)
+            
+            base_query += '''
+                ORDER BY l.type DESC, ps.quantity DESC, l.name ASC
+            '''
+            
+            print(f"🔍 [DEBUG] Query: {base_query}")
+            print(f"🔍 [DEBUG] Params: {params}")
+            
+            cursor.execute(base_query, params)
+            results = [dict(row) for row in cursor.fetchall()]
+            
+            print(f"✅ [DEBUG] Found {len(results)} results")
+            
+        else:
+            # SQLite - mantener como estaba
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            
+            base_query = '''
+                SELECT p.reference_code, p.brand, p.model, p.description,
+                       p.color_info, p.unit_price, p.box_price, p.image_url,
+                       ps.size, ps.quantity, ps.quantity_exhibition,
+                       l.id as location_id, l.name as location_name,
+                       l.type as location_type, l.address as location_address
+                FROM products p
+                JOIN product_sizes ps ON p.id = ps.product_id
+                JOIN locations l ON p.location_name = l.name
+                WHERE ps.quantity > 0 AND p.is_active = 1
+            '''
+            
+            params = []
+            
+            if reference_code:
+                base_query += " AND p.reference_code = ?"
+                params.append(reference_code)
+            elif brand and model:
+                base_query += " AND (p.brand LIKE ? AND p.model LIKE ?)"
+                params.extend([f'%{brand}%', f'%{model}%'])
+            elif brand:
+                base_query += " AND p.brand LIKE ?"
+                params.append(f'%{brand}%')
+            
+            if size:
+                base_query += " AND ps.size = ?"
+                params.append(size)
+            
+            base_query += '''
+                ORDER BY l.type DESC, ps.quantity DESC, l.name ASC
+            '''
+            
+            cursor = conn.execute(base_query, params)
+            results = [dict(row) for row in cursor.fetchall()]
         
-        # Construir query dinámicamente según parámetros
-        base_query = '''
-            SELECT p.reference_code, p.brand, p.model, p.description,
-                   p.color_info, p.unit_price, p.box_price, p.image_url,
-                   ps.size, ps.quantity, ps.quantity_exhibition,
-                   l.id as location_id, l.name as location_name,
-                   l.type as location_type, l.address as location_address
-            FROM products p
-            JOIN product_sizes ps ON p.id = ps.product_id
-            JOIN locations l ON p.location_name = l.name
-            WHERE ps.quantity > 0 AND p.is_active = TRUE
-        '''
+        conn.close()
         
-        params = []
+        if not results:
+            print(f"⚠️ [DEBUG] No results found for brand='{brand}', model='{model}', reference='{reference_code}'")
+            return []
         
-        if reference_code:
-            base_query += " AND p.reference_code = %s"
-            params.append(reference_code)
-        elif brand and model:
-            # Búsqueda por marca y modelo si no hay reference_code
-            base_query += " AND (p.brand ILIKE %s AND p.model ILIKE %s)"
-            params.extend([f'%{brand}%', f'%{model}%'])
-        elif brand:
-            base_query += " AND p.brand ILIKE %s"
-            params.append(f'%{brand}%')
+        # Resto del código de procesamiento...
+        locations_with_stock = {}
         
-        if size:
-            base_query += " AND ps.size = %s"
-            params.append(size)
-        
-        base_query += '''
-            ORDER BY l.type DESC, ps.quantity DESC, l.name ASC
-        '''
-        
-        cursor.execute(base_query, params)
-        results = [dict(row) for row in cursor.fetchall()]
-        
-    else:
-        # SQLite
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        
-        base_query = '''
-            SELECT p.reference_code, p.brand, p.model, p.description,
-                   p.color_info, p.unit_price, p.box_price, p.image_url,
-                   ps.size, ps.quantity, ps.quantity_exhibition,
-                   l.id as location_id, l.name as location_name,
-                   l.type as location_type, l.address as location_address
-            FROM products p
-            JOIN product_sizes ps ON p.id = ps.product_id
-            JOIN locations l ON p.location_name = l.name
-            WHERE ps.quantity > 0 AND p.is_active = 1
-        '''
-        
-        params = []
-        
-        if reference_code:
-            base_query += " AND p.reference_code = ?"
-            params.append(reference_code)
-        elif brand and model:
-            base_query += " AND (p.brand LIKE ? AND p.model LIKE ?)"
-            params.extend([f'%{brand}%', f'%{model}%'])
-        elif brand:
-            base_query += " AND p.brand LIKE ?"
-            params.append(f'%{brand}%')
-        
-        if size:
-            base_query += " AND ps.size = ?"
-            params.append(size)
-        
-        base_query += '''
-            ORDER BY l.type DESC, ps.quantity DESC, l.name ASC
-        '''
-        
-        cursor = conn.execute(base_query, params)
-        results = [dict(row) for row in cursor.fetchall()]
-    
-    conn.close()
-    
-    if not results:
-        return []
-    
-    # Agrupar por ubicación y producto
-    locations_with_stock = {}
-    
-    for result in results:
-        location_key = f"{result['location_id']}_{result['reference_code']}"
-        
-        if location_key not in locations_with_stock:
-            locations_with_stock[location_key] = {
-                "location_info": {
-                    "location_id": result['location_id'],
-                    "location_name": result['location_name'],
-                    "location_type": result['location_type'],
-                    "location_address": result['location_address'] or "Dirección no disponible"
-                },
-                "product_info": {
-                    "reference_code": result['reference_code'],
-                    "brand": result['brand'],
-                    "model": result['model'],
-                    "description": result['description'],
-                    "color": result['color_info'] or "Varios",
-                    "unit_price": float(result['unit_price']) if result['unit_price'] else 0.0,
-                    "box_price": float(result['box_price']) if result['box_price'] else 0.0,
-                    "image_url": result['image_url'] or f"https://via.placeholder.com/300x200?text={result['brand']}+{result['model']}"
-                },
-                "stock_info": {
-                    "available_sizes": [],
-                    "total_stock": 0,
-                    "total_exhibition": 0,
-                    "size_count": 0
-                },
-                "transfer_info": {
-                    "can_request_transfer": True,
-                    "estimated_transfer_time": "2-4 horas" if result['location_type'] == 'local' else "4-8 horas"
+        for result in results:
+            location_key = f"{result['location_id']}_{result['reference_code']}"
+            
+            if location_key not in locations_with_stock:
+                locations_with_stock[location_key] = {
+                    "location_info": {
+                        "location_id": result['location_id'],
+                        "location_name": result['location_name'],
+                        "location_type": result['location_type'],
+                        "location_address": result['location_address'] or "Dirección no disponible"
+                    },
+                    "product_info": {
+                        "reference_code": result['reference_code'],
+                        "brand": result['brand'],
+                        "model": result['model'],
+                        "description": result['description'],
+                        "color": result['color_info'] or "Varios",
+                        "unit_price": float(result['unit_price']) if result['unit_price'] else 0.0,
+                        "box_price": float(result['box_price']) if result['box_price'] else 0.0,
+                        "image_url": result['image_url'] or f"https://via.placeholder.com/300x200?text={result['brand']}+{result['model']}"
+                    },
+                    "stock_info": {
+                        "available_sizes": [],
+                        "total_stock": 0,
+                        "total_exhibition": 0,
+                        "size_count": 0
+                    },
+                    "transfer_info": {
+                        "can_request_transfer": True,
+                        "estimated_transfer_time": "2-4 horas" if result['location_type'] == 'local' else "4-8 horas"
+                    }
                 }
-            }
+            
+            # Agregar información de talla
+            locations_with_stock[location_key]["stock_info"]["available_sizes"].append({
+                "size": result['size'],
+                "quantity_stock": result['quantity'],
+                "quantity_exhibition": result['quantity_exhibition'] or 0
+            })
+            
+            locations_with_stock[location_key]["stock_info"]["total_stock"] += result['quantity']
+            locations_with_stock[location_key]["stock_info"]["total_exhibition"] += (result['quantity_exhibition'] or 0)
+            locations_with_stock[location_key]["stock_info"]["size_count"] += 1
         
-        # Agregar información de talla
-        locations_with_stock[location_key]["stock_info"]["available_sizes"].append({
-            "size": result['size'],
-            "quantity_stock": result['quantity'],
-            "quantity_exhibition": result['quantity_exhibition'] or 0
-        })
+        # Convertir a lista y ordenar por cantidad de stock
+        final_results = list(locations_with_stock.values())
+        final_results.sort(key=lambda x: x['stock_info']['total_stock'], reverse=True)
         
-        locations_with_stock[location_key]["stock_info"]["total_stock"] += result['quantity']
-        locations_with_stock[location_key]["stock_info"]["total_exhibition"] += (result['quantity_exhibition'] or 0)
-        locations_with_stock[location_key]["stock_info"]["size_count"] += 1
-    
-    # Convertir a lista y ordenar por cantidad de stock
-    final_results = list(locations_with_stock.values())
-    final_results.sort(key=lambda x: x['stock_info']['total_stock'], reverse=True)
-    
-    return final_results
+        print(f"✅ [DEBUG] Processed {len(final_results)} unique location-product combinations")
+        
+        return final_results
+        
+    except Exception as e:
+        print(f"❌ [ERROR] find_all_locations_with_product: {str(e)}")
+        print(f"❌ [ERROR] Params were: reference_code='{reference_code}', brand='{brand}', model='{model}', size='{size}'")
+        import traceback
+        traceback.print_exc()
+        return []
 
 def separate_locations_by_user(all_locations, current_user_location_id):
     """
@@ -1258,7 +1339,7 @@ async def scan_sneaker_integrated_enhanced(
     include_transfer_options: bool = True,
     current_user = Depends(get_current_user)
 ):
-    """Escanear tenis con información completa de ubicaciones disponibles"""
+    """Escanear tenis con información completa de ubicaciones disponibles - VERSIÓN ROBUSTA"""
     
     start_time = datetime.now()
     
@@ -1271,153 +1352,144 @@ async def scan_sneaker_integrated_enhanced(
     
     print(f"🔍 Iniciando escaneo mejorado con información de ubicaciones...")
     
-    # Llamar al microservicio real de clasificación
-    classification_result = await call_real_classification_service(content, image.filename)
-    
-    if classification_result and classification_result.get('success'):
-        print(f"✅ Microservicio respondió: {classification_result.get('total_matches_found', 0)} matches")
+    try:
+        # Llamar al microservicio real de clasificación
+        classification_result = await call_real_classification_service(content, image.filename)
         
-        # Usar la función mejorada de combinación
-        merged_results = merge_classification_with_inventory(
-            classification_result, 
-            current_user['location_id']
-        )
+        if classification_result and classification_result.get('success'):
+            print(f"✅ Microservicio respondió: {classification_result.get('total_matches_found', 0)} matches")
+            
+            # Usar la función mejorada de combinación con try-catch
+            try:
+                merged_results = merge_classification_with_inventory(
+                    classification_result, 
+                    current_user['location_id']
+                )
+                print(f"✅ Merged results: {len(merged_results)} productos procesados")
+                
+            except Exception as merge_error:
+                print(f"❌ Error en merge_classification_with_inventory_enhanced: {merge_error}")
+                # Fallback a resultados básicos
+                merged_results = create_fallback_results(classification_result, current_user)
+            
+            processing_time = (datetime.now() - start_time).total_seconds() * 1000
+            
+            # Estadísticas con validación
+            total_locations_with_stock = 0
+            products_in_current_location = 0
+            products_requiring_transfer = 0
+            
+            for result in merged_results:
+                try:
+                    total_locations_with_stock += result.get('locations', {}).get('total_locations_found', 0)
+                    if result.get('availability', {}).get('can_sell_now', False):
+                        products_in_current_location += 1
+                    elif result.get('availability', {}).get('can_request_transfer', False):
+                        products_requiring_transfer += 1
+                except Exception:
+                    continue
+            
+            return {
+                "success": True,
+                "scan_timestamp": datetime.now().isoformat(),
+                "scanned_by": {
+                    "user_id": current_user['id'],
+                    "email": current_user['email'],
+                    "name": f"{current_user['first_name']} {current_user['last_name']}",
+                    "role": current_user['role'],
+                    "location_id": current_user['location_id']
+                },
+                "user_location": f"Local #{current_user['location_id']}",
+                "results": {
+                    "best_match": merged_results[0] if merged_results else None,
+                    "alternative_matches": merged_results[1:] if len(merged_results) > 1 else [],
+                    "total_matches_found": len(merged_results)
+                },
+                "availability_summary": {
+                    "products_available_locally": products_in_current_location,
+                    "products_requiring_transfer": products_requiring_transfer,
+                    "total_locations_with_stock": total_locations_with_stock,
+                    "can_sell_immediately": products_in_current_location > 0,
+                    "transfer_options_available": products_requiring_transfer > 0
+                },
+                "processing_time_ms": round(processing_time, 2),
+                "image_info": {
+                    "filename": image.filename,
+                    "size_bytes": len(content),
+                    "content_type": image.content_type
+                },
+                "classification_service": {
+                    "service": "real_microservice",
+                    "url": "https://sneaker-api-v2.onrender.com/api/v2/classify",
+                    "model": classification_result.get('model_info', {}).get('model', 'jina-clip-v2'),
+                    "total_database_matches": classification_result.get('total_matches_found', 0)
+                },
+                "inventory_service": {
+                    "source": "enhanced_multi_location",
+                    "locations_searched": "all_active",
+                    "include_transfer_options": include_transfer_options
+                }
+            }
+        else:
+            # Microservicio no disponible
+            return await handle_classification_fallback(content, image, current_user, start_time)
+            
+    except Exception as e:
+        print(f"❌ Error general en scan_sneaker_integrated_enhanced: {str(e)}")
+        import traceback
+        traceback.print_exc()
         
+        # Retornar error estructurado
         processing_time = (datetime.now() - start_time).total_seconds() * 1000
         
-        # Estadísticas adicionales
-        total_locations_with_stock = sum(
-            result['locations']['total_locations_found'] 
-            for result in merged_results
-        )
-        
-        products_in_current_location = len([
-            result for result in merged_results 
-            if result['availability']['can_sell_now']
-        ])
-        
-        products_requiring_transfer = len([
-            result for result in merged_results 
-            if result['availability']['can_request_transfer'] and not result['availability']['can_sell_now']
-        ])
-        
         return {
-            "success": True,
+            "success": False,
+            "error": "Error interno del servidor",
+            "error_details": str(e),
             "scan_timestamp": datetime.now().isoformat(),
-            "scanned_by": {
-                "user_id": current_user['id'],
-                "email": current_user['email'],
-                "name": f"{current_user['first_name']} {current_user['last_name']}",
-                "role": current_user['role'],
-                "location_id": current_user['location_id']
-            },
-            "user_location": f"Local #{current_user['location_id']}",
-            "results": {
-                "best_match": merged_results[0] if merged_results else None,
-                "alternative_matches": merged_results[1:] if len(merged_results) > 1 else [],
-                "total_matches_found": len(merged_results)
-            },
-            "availability_summary": {
-                "products_available_locally": products_in_current_location,
-                "products_requiring_transfer": products_requiring_transfer,
-                "total_locations_with_stock": total_locations_with_stock,
-                "can_sell_immediately": products_in_current_location > 0,
-                "transfer_options_available": products_requiring_transfer > 0
-            },
             "processing_time_ms": round(processing_time, 2),
-            "image_info": {
-                "filename": image.filename,
-                "size_bytes": len(content),
-                "content_type": image.content_type
+            "fallback_available": True
+        }
+
+def create_fallback_results(classification_result, current_user):
+    """Crear resultados básicos cuando falla el procesamiento avanzado"""
+    fallback_results = []
+    
+    for rank, result in enumerate(classification_result.get('results', [])[:3], 1):
+        fallback_result = {
+            "rank": rank,
+            "similarity_score": result.get('similarity_score', 0.0),
+            "confidence_percentage": result.get('confidence_percentage', 0.0),
+            "confidence_level": result.get('confidence_level', 'low'),
+            "reference": {
+                "code": f"FALLBACK-{rank:03d}",
+                "brand": result.get('brand', 'Unknown'),
+                "model": result.get('model_name', 'Unknown'),
+                "color": result.get('color', 'Varios'),
+                "description": f"{result.get('brand', 'Unknown')} {result.get('model_name', 'Unknown')}",
+                "photo": f"https://via.placeholder.com/300x300?text=Producto+{rank}"
             },
-            "classification_service": {
-                "service": "real_microservice",
-                "url": "https://sneaker-api-v2.onrender.com/api/v2/classify",
-                "model": classification_result.get('model_info', {}).get('model', 'jina-clip-v2'),
-                "total_database_matches": classification_result.get('total_matches_found', 0)
+            "availability": {
+                "summary": {
+                    "current_location": {"has_stock": False, "total_stock": 0},
+                    "other_locations": {"has_stock": False, "total_stock": 0},
+                    "total_system": {"total_stock": 0, "total_locations": 0}
+                },
+                "recommended_action": "Información de inventario no disponible",
+                "action_type": "inventory_error",
+                "can_sell_now": False,
+                "can_request_transfer": False
             },
-            "inventory_service": {
-                "source": "enhanced_multi_location",
-                "locations_searched": "all_active",
-                "include_transfer_options": include_transfer_options
+            "locations": {
+                "current_location": [],
+                "other_locations": [],
+                "total_locations_found": 0
             }
         }
-    else:
-        # Mantener fallback existente
-        return await handle_classification_fallback(content, image, current_user, start_time)
+        fallback_results.append(fallback_result)
+    
+    return fallback_results
 
-async def handle_classification_fallback(content, image, current_user, start_time):
-    """Manejar fallback cuando el microservicio no está disponible"""
-    print("⚠️ Microservicio no disponible, usando datos mock")
-    
-    mock_results = [{
-        "rank": 1,
-        "similarity_score": 0.50,
-        "confidence_percentage": 50.0,
-        "confidence_level": "medium",
-        "reference": {
-            "code": "FALLBACK-001",
-            "brand": "Unknown",
-            "model": "Sistema en mantenimiento",
-            "color": "N/A",
-            "description": "Microservicio de clasificación temporalmente no disponible",
-            "photo": "https://via.placeholder.com/300x300?text=Sistema+en+Mantenimiento"
-        },
-        "availability": {
-            "summary": {
-                "current_location": {"has_stock": False, "total_stock": 0},
-                "other_locations": {"has_stock": False, "total_stock": 0},
-                "total_system": {"total_stock": 0, "total_locations": 0}
-            },
-            "recommended_action": "Sistema de clasificación en mantenimiento",
-            "action_type": "service_unavailable",
-            "can_sell_now": False,
-            "can_request_transfer": False
-        },
-        "locations": {
-            "current_location": [],
-            "other_locations": [],
-            "total_locations_found": 0
-        }
-    }]
-    
-    processing_time = (datetime.now() - start_time).total_seconds() * 1000
-    
-    return {
-        "success": True,
-        "scan_timestamp": datetime.now().isoformat(),
-        "scanned_by": {
-            "user_id": current_user['id'],
-            "email": current_user['email'],
-            "name": f"{current_user['first_name']} {current_user['last_name']}",
-            "role": current_user['role'],
-            "location_id": current_user['location_id']
-        },
-        "user_location": f"Local #{current_user['location_id']}",
-        "results": {
-            "best_match": mock_results[0],
-            "alternative_matches": [],
-            "total_matches_found": 1
-        },
-        "availability_summary": {
-            "products_available_locally": 0,
-            "products_requiring_transfer": 0,
-            "total_locations_with_stock": 0,
-            "can_sell_immediately": False,
-            "transfer_options_available": False
-        },
-        "processing_time_ms": round(processing_time, 2),
-        "image_info": {
-            "filename": image.filename,
-            "size_bytes": len(content),
-            "content_type": image.content_type
-        },
-        "classification_service": {
-            "service": "fallback_mock",
-            "status": "microservice_unavailable",
-            "message": "Usando datos mock como respaldo"
-        }
-    }
 @app.get("/api/v1/classify/health")
 async def classification_health():
     return {
