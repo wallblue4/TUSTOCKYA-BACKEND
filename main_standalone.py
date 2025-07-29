@@ -959,7 +959,7 @@ async def call_real_classification_service(image_content: bytes, filename: str):
 
 def merge_classification_with_inventory(classification_result, user_location_id):
     """
-    Versión mejorada con mejor manejo de errores
+    Versión que NO skipea ningún resultado y acepta todos los matches del microservicio
     """
     if not classification_result or not classification_result.get('results'):
         print("⚠️ [DEBUG] No classification results to process")
@@ -970,25 +970,39 @@ def merge_classification_with_inventory(classification_result, user_location_id)
     try:
         for rank, result in enumerate(classification_result['results'][:3], 1):
             model_name = result.get('model_name', '')
-            brand = result.get('brand', 'Unknown')
+            original_brand = result.get('brand', 'Unknown')
             
-            print(f"🔍 [DEBUG] Processing result {rank}: brand='{brand}', model='{model_name}'")
+            print(f"🔍 [DEBUG] Processing result {rank}: original_brand='{original_brand}', model='{model_name}'")
             
-            # ✅ FIX: Validar datos antes de buscar
+            # ✅ CAMBIO: Siempre procesar, nunca skipear
+            # Si brand es Unknown, extraer del modelo, pero seguir procesando
+            if original_brand == 'Unknown' or not original_brand:
+                extracted_brand, clean_model = extract_brand_from_model(model_name)
+                brand = extracted_brand
+                model_for_search = clean_model
+                print(f"🔧 [DEBUG] Extracted brand='{brand}', clean_model='{model_for_search}' from original model")
+            else:
+                brand = original_brand
+                model_for_search = model_name
+            
+            # Si aún no tenemos marca válida, usar el modelo completo como marca
             if not brand or brand == 'Unknown':
-                print(f"⚠️ [DEBUG] Skipping result {rank} - invalid brand")
-                continue
+                print(f"🔧 [DEBUG] Using full model as brand for result {rank}")
+                brand = model_name.split()[0] if model_name else "Generic"
+                model_for_search = model_name
                 
-            if not model_name:
-                print(f"⚠️ [DEBUG] Using brand as fallback for model in result {rank}")
-                model_name = brand
+            if not model_for_search:
+                print(f"🔧 [DEBUG] Using brand as model for result {rank}")
+                model_for_search = brand
             
-            # Buscar en todas las ubicaciones
+            print(f"✅ [DEBUG] Final search params: brand='{brand}', model='{model_for_search}'")
+            
+            # Buscar en todas las ubicaciones - SIEMPRE intentar
             try:
                 all_locations = find_all_locations_with_product(
                     reference_code=None,  # Búsqueda por similitud
                     brand=brand,
-                    model=model_name
+                    model=model_for_search
                 )
                 
                 print(f"✅ [DEBUG] Found {len(all_locations)} locations for result {rank}")
@@ -997,123 +1011,189 @@ def merge_classification_with_inventory(classification_result, user_location_id)
                 print(f"❌ [ERROR] Error searching locations for result {rank}: {search_error}")
                 all_locations = []
             
-            # Si no se encontraron ubicaciones, crear resultado básico
-            if not all_locations:
-                print(f"⚠️ [DEBUG] No locations found for result {rank}, creating fallback")
-                
-                fallback_result = {
-                    "rank": rank,
-                    "similarity_score": result.get('similarity_score', 0.0),
-                    "confidence_percentage": result.get('confidence_percentage', 0.0),
-                    "confidence_level": result.get('confidence_level', 'low'),
-                    "reference": {
-                        "code": f"NOT-FOUND-{rank:03d}",
-                        "brand": brand,
-                        "model": model_name,
-                        "color": result.get('color', 'Varios'),
-                        "description": f"{brand} {model_name}",
-                        "photo": f"https://via.placeholder.com/300x300?text={brand.replace(' ', '+')}+{model_name.replace(' ', '+')}"
-                    },
-                    "availability": {
-                        "summary": {
-                            "current_location": {"has_stock": False, "total_stock": 0, "available_sizes": [], "locations_count": 0},
-                            "other_locations": {"has_stock": False, "total_stock": 0, "additional_sizes": [], "locations_count": 0, "can_request_transfer": False},
-                            "total_system": {"total_stock": 0, "total_locations": 0, "all_available_sizes": []}
+            # ✅ CAMBIO: Procesar TODOS los resultados, tengan o no inventario
+            if all_locations:
+                # Procesar ubicaciones encontradas
+                try:
+                    current_location, other_locations = separate_locations_by_user(all_locations, user_location_id)
+                    availability_summary = calculate_availability_summary(current_location, other_locations)
+                    
+                    # Determinar acción recomendada
+                    if availability_summary['current_location']['has_stock']:
+                        recommended_action = "✅ Disponible para venta inmediata"
+                        action_type = "sell_immediately"
+                    elif availability_summary['other_locations']['has_stock']:
+                        locations_count = availability_summary['other_locations']['locations_count']
+                        recommended_action = f"📦 Solicitar transferencia ({locations_count} ubicación{'es' if locations_count > 1 else ''} disponible{'s' if locations_count > 1 else ''})"
+                        action_type = "request_transfer"
+                    else:
+                        recommended_action = "❌ Sin stock en el sistema"
+                        action_type = "out_of_stock"
+                    
+                    # Construir resultado con inventario
+                    enhanced_result = {
+                        "rank": rank,
+                        "similarity_score": result.get('similarity_score', 0.0),
+                        "confidence_percentage": result.get('confidence_percentage', 0.0),
+                        "confidence_level": result.get('confidence_level', 'low'),
+                        "reference": {
+                            "code": current_location[0]['product_info']['reference_code'] if current_location else f"CLASSIFIED-{rank:03d}",
+                            "brand": brand,
+                            "model": model_name,  # Usar modelo original para mostrar
+                            "color": current_location[0]['product_info']['color'] if current_location else result.get('color', 'Varios'),
+                            "description": f"{brand} {model_name}",
+                            "photo": current_location[0]['product_info']['image_url'] if current_location else f"https://via.placeholder.com/300x300?text={brand.replace(' ', '+')}+{model_name.replace(' ', '+')}"
                         },
-                        "recommended_action": "❌ Producto no encontrado en inventario",
-                        "action_type": "not_in_inventory",
-                        "can_sell_now": False,
-                        "can_request_transfer": False
-                    },
-                    "locations": {
-                        "current_location": [],
-                        "other_locations": [],
-                        "total_locations_found": 0
-                    },
-                    "pricing": {
-                        "unit_price": 0.0,
-                        "box_price": 0.0,
-                        "has_pricing": False
-                    },
-                    "classification_source": "real_microservice",
-                    "inventory_source": "not_found",
-                    "original_db_id": result.get('original_db_id'),
-                    "image_path": result.get('image_path')
-                }
-                
-                merged_results.append(fallback_result)
-                continue
+                        "availability": {
+                            "summary": availability_summary,
+                            "recommended_action": recommended_action,
+                            "action_type": action_type,
+                            "can_sell_now": availability_summary['current_location']['has_stock'],
+                            "can_request_transfer": availability_summary['other_locations']['can_request_transfer']
+                        },
+                        "locations": {
+                            "current_location": current_location,
+                            "other_locations": other_locations,
+                            "total_locations_found": len(all_locations)
+                        },
+                        "pricing": {
+                            "unit_price": current_location[0]['product_info']['unit_price'] if current_location else 0.0,
+                            "box_price": current_location[0]['product_info']['box_price'] if current_location else 0.0,
+                            "has_pricing": len(current_location) > 0
+                        },
+                        "classification_source": "real_microservice",
+                        "inventory_source": "found_in_database",
+                        "brand_extraction": {
+                            "original_brand": original_brand,
+                            "final_brand": brand,
+                            "extraction_method": "model_analysis" if original_brand == "Unknown" else "microservice_direct"
+                        },
+                        "original_db_id": result.get('original_db_id'),
+                        "image_path": result.get('image_path')
+                    }
+                    
+                except Exception as process_error:
+                    print(f"❌ [ERROR] Error processing locations for result {rank}: {process_error}")
+                    # Crear resultado básico si hay error procesando
+                    enhanced_result = create_basic_classification_result(rank, result, brand, model_name, original_brand)
+            else:
+                # ✅ CAMBIO: Crear resultado incluso si no hay inventario
+                print(f"📝 [DEBUG] No inventory found for result {rank}, creating classification-only result")
+                enhanced_result = create_basic_classification_result(rank, result, brand, model_name, original_brand)
             
-            # Separar ubicación actual vs otras
-            try:
-                current_location, other_locations = separate_locations_by_user(all_locations, user_location_id)
-                availability_summary = calculate_availability_summary(current_location, other_locations)
-                
-                # Determinar acción recomendada
-                if availability_summary['current_location']['has_stock']:
-                    recommended_action = "✅ Disponible para venta inmediata"
-                    action_type = "sell_immediately"
-                elif availability_summary['other_locations']['has_stock']:
-                    locations_count = availability_summary['other_locations']['locations_count']
-                    recommended_action = f"📦 Solicitar transferencia ({locations_count} ubicación{'es' if locations_count > 1 else ''} disponible{'s' if locations_count > 1 else ''})"
-                    action_type = "request_transfer"
-                else:
-                    recommended_action = "❌ Sin stock en el sistema"
-                    action_type = "out_of_stock"
-                
-                # Construir resultado completo
-                enhanced_result = {
-                    "rank": rank,
-                    "similarity_score": result.get('similarity_score', 0.0),
-                    "confidence_percentage": result.get('confidence_percentage', 0.0),
-                    "confidence_level": result.get('confidence_level', 'low'),
-                    "reference": {
-                        "code": current_location[0]['product_info']['reference_code'] if current_location else f"SEARCH-{rank:03d}",
-                        "brand": brand,
-                        "model": model_name,
-                        "color": current_location[0]['product_info']['color'] if current_location else result.get('color', 'Varios'),
-                        "description": f"{brand} {model_name}",
-                        "photo": current_location[0]['product_info']['image_url'] if current_location else f"https://via.placeholder.com/300x300?text={brand.replace(' ', '+')}+{model_name.replace(' ', '+')}"
-                    },
-                    "availability": {
-                        "summary": availability_summary,
-                        "recommended_action": recommended_action,
-                        "action_type": action_type,
-                        "can_sell_now": availability_summary['current_location']['has_stock'],
-                        "can_request_transfer": availability_summary['other_locations']['can_request_transfer']
-                    },
-                    "locations": {
-                        "current_location": current_location,
-                        "other_locations": other_locations,
-                        "total_locations_found": len(all_locations)
-                    },
-                    "pricing": {
-                        "unit_price": current_location[0]['product_info']['unit_price'] if current_location else 0.0,
-                        "box_price": current_location[0]['product_info']['box_price'] if current_location else 0.0,
-                        "has_pricing": len(current_location) > 0
-                    },
-                    "classification_source": "real_microservice",
-                    "inventory_source": "enhanced_multi_location",
-                    "original_db_id": result.get('original_db_id'),
-                    "image_path": result.get('image_path')
-                }
-                
-                merged_results.append(enhanced_result)
-                
-                print(f"✅ [DEBUG] Processed result {rank}: {availability_summary['total_system']['total_locations']} ubicaciones, {availability_summary['total_system']['total_stock']} unidades")
-                
-            except Exception as process_error:
-                print(f"❌ [ERROR] Error processing locations for result {rank}: {process_error}")
-                continue
+            merged_results.append(enhanced_result)
+            print(f"✅ [DEBUG] Added result {rank} to final results")
         
         print(f"✅ [DEBUG] Final merged_results count: {len(merged_results)}")
         return merged_results
         
     except Exception as e:
-        print(f"❌ [ERROR] merge_classification_with_inventory_enhanced: {str(e)}")
+        print(f"❌ [ERROR] merge_classification_with_inventory_enhanced_no_skip: {str(e)}")
         import traceback
         traceback.print_exc()
         return []
+
+def create_basic_classification_result(rank, original_result, brand, model_name, original_brand):
+    """Crear resultado básico cuando no hay inventario pero sí clasificación"""
+    return {
+        "rank": rank,
+        "similarity_score": original_result.get('similarity_score', 0.0),
+        "confidence_percentage": original_result.get('confidence_percentage', 0.0),
+        "confidence_level": original_result.get('confidence_level', 'low'),
+        "reference": {
+            "code": f"CLASSIFIED-{rank:03d}",
+            "brand": brand,
+            "model": model_name,
+            "color": original_result.get('color', 'Varios'),
+            "description": f"{brand} {model_name}",
+            "photo": f"https://via.placeholder.com/300x300?text={brand.replace(' ', '+')}+{model_name.replace(' ', '+')}"
+        },
+        "availability": {
+            "summary": {
+                "current_location": {"has_stock": False, "total_stock": 0, "available_sizes": [], "locations_count": 0},
+                "other_locations": {"has_stock": False, "total_stock": 0, "additional_sizes": [], "locations_count": 0, "can_request_transfer": False},
+                "total_system": {"total_stock": 0, "total_locations": 0, "all_available_sizes": []}
+            },
+            "recommended_action": "🔍 Producto identificado - No disponible en inventario actual",
+            "action_type": "classified_not_in_inventory",
+            "can_sell_now": False,
+            "can_request_transfer": False
+        },
+        "locations": {
+            "current_location": [],
+            "other_locations": [],
+            "total_locations_found": 0
+        },
+        "pricing": {
+            "unit_price": 0.0,
+            "box_price": 0.0,
+            "has_pricing": False
+        },
+        "classification_source": "real_microservice",
+        "inventory_source": "not_in_current_inventory",
+        "brand_extraction": {
+            "original_brand": original_brand,
+            "final_brand": brand,
+            "extraction_method": "model_analysis" if original_brand == "Unknown" else "microservice_direct"
+        },
+        "suggestions": {
+            "can_add_to_inventory": True,
+            "can_search_suppliers": True,
+            "similar_products_available": False
+        },
+        "original_db_id": original_result.get('original_db_id'),
+        "image_path": original_result.get('image_path')
+    }
+
+def extract_brand_from_model(model_name: str):
+    """
+    Extraer marca del nombre del modelo cuando brand='Unknown'
+    VERSIÓN MEJORADA
+    """
+    if not model_name:
+        return "Generic", model_name
+    
+    model_lower = model_name.lower()
+    
+    # Mapeo de marcas conocidas con sus términos
+    brand_keywords = {
+        'Nike': ['nike', 'air max', 'air force', 'zoom', 'dunk', 'jordan', 'react', 'vapormax'],
+        'Adidas': ['adidas', 'ultraboost', 'stan smith', 'superstar', 'gazelle', 'nmd', 'yeezy'],
+        'Puma': ['puma', 'suede', 'clyde', 'rs-x'],
+        'Converse': ['converse', 'chuck taylor', 'all star'],
+        'Vans': ['vans', 'old skool', 'authentic', 'sk8'],
+        'New Balance': ['new balance', 'nb', '990', '574'],
+        'Reebok': ['reebok', 'classic', 'club c'],
+        'Fila': ['fila', 'disruptor'],
+        'Skechers': ['skechers'],
+        'Jordan': ['jordan', 'retro', 'aj'],
+        'Asics': ['asics', 'gel']
+    }
+    
+    # Buscar marca en el modelo
+    for brand, keywords in brand_keywords.items():
+        for keyword in keywords:
+            if keyword in model_lower:
+                # Limpiar el modelo removiendo la marca
+                clean_model = model_name
+                
+                # Si el keyword está al inicio, removerlo
+                if model_lower.startswith(keyword):
+                    clean_model = model_name[len(keyword):].strip()
+                elif keyword != brand.lower():
+                    # Si es un término específico (no la marca), mantener el modelo
+                    clean_model = model_name
+                
+                return brand, clean_model if clean_model else model_name
+    
+    # Si no se encuentra marca conocida, asumir que la primera palabra es la marca
+    words = model_name.split()
+    if len(words) >= 1:
+        potential_brand = words[0].title()
+        remaining_model = ' '.join(words[1:]) if len(words) > 1 else model_name
+        return potential_brand, remaining_model
+    
+    return "Generic", model_name
 
 def find_all_locations_with_product(reference_code: str, brand: str = None, model: str = None, size: str = None):
     """
@@ -1339,7 +1419,7 @@ async def scan_sneaker_integrated_enhanced(
     include_transfer_options: bool = True,
     current_user = Depends(get_current_user)
 ):
-    """Escanear tenis con información completa de ubicaciones disponibles - VERSIÓN ROBUSTA"""
+    """Escanear tenis con información completa de ubicaciones disponibles - SIN SKIPEAR RESULTADOS"""
     
     start_time = datetime.now()
     
@@ -1359,7 +1439,7 @@ async def scan_sneaker_integrated_enhanced(
         if classification_result and classification_result.get('success'):
             print(f"✅ Microservicio respondió: {classification_result.get('total_matches_found', 0)} matches")
             
-            # Usar la función mejorada de combinación con try-catch
+            # ✅ USAR LA FUNCIÓN QUE NO SKIPEA
             try:
                 merged_results = merge_classification_with_inventory(
                     classification_result, 
@@ -1368,7 +1448,7 @@ async def scan_sneaker_integrated_enhanced(
                 print(f"✅ Merged results: {len(merged_results)} productos procesados")
                 
             except Exception as merge_error:
-                print(f"❌ Error en merge_classification_with_inventory_enhanced: {merge_error}")
+                print(f"❌ Error en merge_classification_with_inventory: {merge_error}")
                 # Fallback a resultados básicos
                 merged_results = create_fallback_results(classification_result, current_user)
             
@@ -1378,14 +1458,21 @@ async def scan_sneaker_integrated_enhanced(
             total_locations_with_stock = 0
             products_in_current_location = 0
             products_requiring_transfer = 0
+            products_classified_only = 0
             
             for result in merged_results:
                 try:
                     total_locations_with_stock += result.get('locations', {}).get('total_locations_found', 0)
+                    
+                    action_type = result.get('availability', {}).get('action_type', '')
+                    
                     if result.get('availability', {}).get('can_sell_now', False):
                         products_in_current_location += 1
                     elif result.get('availability', {}).get('can_request_transfer', False):
                         products_requiring_transfer += 1
+                    elif action_type == 'classified_not_in_inventory':
+                        products_classified_only += 1
+                        
                 except Exception:
                     continue
             
@@ -1408,9 +1495,11 @@ async def scan_sneaker_integrated_enhanced(
                 "availability_summary": {
                     "products_available_locally": products_in_current_location,
                     "products_requiring_transfer": products_requiring_transfer,
+                    "products_classified_only": products_classified_only,
                     "total_locations_with_stock": total_locations_with_stock,
                     "can_sell_immediately": products_in_current_location > 0,
-                    "transfer_options_available": products_requiring_transfer > 0
+                    "transfer_options_available": products_requiring_transfer > 0,
+                    "classification_successful": len(merged_results) > 0
                 },
                 "processing_time_ms": round(processing_time, 2),
                 "image_info": {
@@ -1427,7 +1516,8 @@ async def scan_sneaker_integrated_enhanced(
                 "inventory_service": {
                     "source": "enhanced_multi_location",
                     "locations_searched": "all_active",
-                    "include_transfer_options": include_transfer_options
+                    "include_transfer_options": include_transfer_options,
+                    "skip_unknown_brands": False  # ✅ Indicar que NO skipeamos
                 }
             }
         else:
