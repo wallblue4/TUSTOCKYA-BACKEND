@@ -959,7 +959,7 @@ async def call_real_classification_service(image_content: bytes, filename: str):
 
 def merge_classification_with_inventory(classification_result, user_location_id):
     """
-    Versión que NO skipea ningún resultado y acepta todos los matches del microservicio
+    Versión mejorada con búsqueda por descripción
     """
     if not classification_result or not classification_result.get('results'):
         print("⚠️ [DEBUG] No classification results to process")
@@ -974,18 +974,17 @@ def merge_classification_with_inventory(classification_result, user_location_id)
             
             print(f"🔍 [DEBUG] Processing result {rank}: original_brand='{original_brand}', model='{model_name}'")
             
-            # ✅ CAMBIO: Siempre procesar, nunca skipear
-            # Si brand es Unknown, extraer del modelo, pero seguir procesando
+            # Extraer marca si es necesario
             if original_brand == 'Unknown' or not original_brand:
                 extracted_brand, clean_model = extract_brand_from_model(model_name)
                 brand = extracted_brand
-                model_for_search = clean_model
-                print(f"🔧 [DEBUG] Extracted brand='{brand}', clean_model='{model_for_search}' from original model")
+                model_for_search = model_name  # ✅ CAMBIO: Usar modelo completo para búsqueda
+                print(f"🔧 [DEBUG] Extracted brand='{brand}', using full model='{model_for_search}' for search")
             else:
                 brand = original_brand
                 model_for_search = model_name
             
-            # Si aún no tenemos marca válida, usar el modelo completo como marca
+            # Fallback si no hay marca
             if not brand or brand == 'Unknown':
                 print(f"🔧 [DEBUG] Using full model as brand for result {rank}")
                 brand = model_name.split()[0] if model_name else "Generic"
@@ -997,12 +996,12 @@ def merge_classification_with_inventory(classification_result, user_location_id)
             
             print(f"✅ [DEBUG] Final search params: brand='{brand}', model='{model_for_search}'")
             
-            # Buscar en todas las ubicaciones - SIEMPRE intentar
+            # ✅ USAR LA FUNCIÓN MEJORADA
             try:
                 all_locations = find_all_locations_with_product(
-                    reference_code=None,  # Búsqueda por similitud
+                    reference_code=None,
                     brand=brand,
-                    model=model_for_search
+                    model=model_for_search  # Buscar con modelo completo
                 )
                 
                 print(f"✅ [DEBUG] Found {len(all_locations)} locations for result {rank}")
@@ -1011,9 +1010,8 @@ def merge_classification_with_inventory(classification_result, user_location_id)
                 print(f"❌ [ERROR] Error searching locations for result {rank}: {search_error}")
                 all_locations = []
             
-            # ✅ CAMBIO: Procesar TODOS los resultados, tengan o no inventario
+            # Procesar resultados (código igual que antes)
             if all_locations:
-                # Procesar ubicaciones encontradas
                 try:
                     current_location, other_locations = separate_locations_by_user(all_locations, user_location_id)
                     availability_summary = calculate_availability_summary(current_location, other_locations)
@@ -1030,19 +1028,19 @@ def merge_classification_with_inventory(classification_result, user_location_id)
                         recommended_action = "❌ Sin stock en el sistema"
                         action_type = "out_of_stock"
                     
-                    # Construir resultado con inventario
+                    # Construir resultado con inventario encontrado
                     enhanced_result = {
                         "rank": rank,
                         "similarity_score": result.get('similarity_score', 0.0),
                         "confidence_percentage": result.get('confidence_percentage', 0.0),
                         "confidence_level": result.get('confidence_level', 'low'),
                         "reference": {
-                            "code": current_location[0]['product_info']['reference_code'] if current_location else f"CLASSIFIED-{rank:03d}",
+                            "code": current_location[0]['product_info']['reference_code'] if current_location else all_locations[0]['product_info']['reference_code'],
                             "brand": brand,
-                            "model": model_name,  # Usar modelo original para mostrar
-                            "color": current_location[0]['product_info']['color'] if current_location else result.get('color', 'Varios'),
+                            "model": model_name,  # Modelo original del microservicio
+                            "color": current_location[0]['product_info']['color'] if current_location else all_locations[0]['product_info']['color'],
                             "description": f"{brand} {model_name}",
-                            "photo": current_location[0]['product_info']['image_url'] if current_location else f"https://via.placeholder.com/300x300?text={brand.replace(' ', '+')}+{model_name.replace(' ', '+')}"
+                            "photo": current_location[0]['product_info']['image_url'] if current_location else all_locations[0]['product_info']['image_url']
                         },
                         "availability": {
                             "summary": availability_summary,
@@ -1057,9 +1055,9 @@ def merge_classification_with_inventory(classification_result, user_location_id)
                             "total_locations_found": len(all_locations)
                         },
                         "pricing": {
-                            "unit_price": current_location[0]['product_info']['unit_price'] if current_location else 0.0,
-                            "box_price": current_location[0]['product_info']['box_price'] if current_location else 0.0,
-                            "has_pricing": len(current_location) > 0
+                            "unit_price": current_location[0]['product_info']['unit_price'] if current_location else all_locations[0]['product_info']['unit_price'],
+                            "box_price": current_location[0]['product_info']['box_price'] if current_location else all_locations[0]['product_info']['box_price'],
+                            "has_pricing": True
                         },
                         "classification_source": "real_microservice",
                         "inventory_source": "found_in_database",
@@ -1068,16 +1066,16 @@ def merge_classification_with_inventory(classification_result, user_location_id)
                             "final_brand": brand,
                             "extraction_method": "model_analysis" if original_brand == "Unknown" else "microservice_direct"
                         },
+                        "search_strategy": "enhanced_description_search",
                         "original_db_id": result.get('original_db_id'),
                         "image_path": result.get('image_path')
                     }
                     
                 except Exception as process_error:
                     print(f"❌ [ERROR] Error processing locations for result {rank}: {process_error}")
-                    # Crear resultado básico si hay error procesando
                     enhanced_result = create_basic_classification_result(rank, result, brand, model_name, original_brand)
             else:
-                # ✅ CAMBIO: Crear resultado incluso si no hay inventario
+                # Sin inventario
                 print(f"📝 [DEBUG] No inventory found for result {rank}, creating classification-only result")
                 enhanced_result = create_basic_classification_result(rank, result, brand, model_name, original_brand)
             
@@ -1088,7 +1086,7 @@ def merge_classification_with_inventory(classification_result, user_location_id)
         return merged_results
         
     except Exception as e:
-        print(f"❌ [ERROR] merge_classification_with_inventory_enhanced_no_skip: {str(e)}")
+        print(f"❌ [ERROR] merge_classification_with_inventory_enhanced_no_skip_improved: {str(e)}")
         import traceback
         traceback.print_exc()
         return []
@@ -1197,7 +1195,7 @@ def extract_brand_from_model(model_name: str):
 
 def find_all_locations_with_product(reference_code: str, brand: str = None, model: str = None, size: str = None):
     """
-    Encontrar todas las ubicaciones que tienen un producto específico disponible - VERSIÓN CORREGIDA
+    Búsqueda mejorada que incluye descripción y términos parciales
     """
     
     try:
@@ -1207,7 +1205,7 @@ def find_all_locations_with_product(reference_code: str, brand: str = None, mode
             conn = psycopg2.connect(DB_PATH)
             cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             
-            # ✅ FIX: Usar 1 en lugar de TRUE para PostgreSQL
+            # ✅ BÚSQUEDA MEJORADA: Incluir descripción y términos parciales
             base_query = '''
                 SELECT p.reference_code, p.brand, p.model, p.description,
                        p.color_info, p.unit_price, p.box_price, p.image_url,
@@ -1221,35 +1219,74 @@ def find_all_locations_with_product(reference_code: str, brand: str = None, mode
             '''
             
             params = []
+            search_conditions = []
             
             if reference_code:
-                base_query += " AND p.reference_code = %s"
+                # Búsqueda exacta por código
+                search_conditions.append("p.reference_code = %s")
                 params.append(reference_code)
             elif brand and model:
-                base_query += " AND (p.brand ILIKE %s AND p.model ILIKE %s)"
+                # ✅ BÚSQUEDA AMPLIADA: Multiple estrategias
+                
+                # Estrategia 1: Marca exacta + modelo en descripción
+                condition1 = "(p.brand ILIKE %s AND p.description ILIKE %s)"
                 params.extend([f'%{brand}%', f'%{model}%'])
+                
+                # Estrategia 2: Términos del modelo en descripción
+                model_terms = model.lower().split()
+                model_conditions = []
+                for term in model_terms:
+                    if len(term) > 2:  # Solo términos significativos
+                        model_conditions.append("p.description ILIKE %s")
+                        params.append(f'%{term}%')
+                
+                if model_conditions:
+                    condition2 = f"(p.brand ILIKE %s AND ({' AND '.join(model_conditions)}))"
+                    params.insert(-len(model_conditions), f'%{brand}%')
+                else:
+                    condition2 = condition1
+                
+                # Estrategia 3: Modelo parcial en campo model
+                condition3 = "(p.brand ILIKE %s AND p.model ILIKE %s)"
+                params.extend([f'%{brand}%', f'%{model.split()[0] if model.split() else model}%'])
+                
+                search_conditions.append(f"({condition1} OR {condition2} OR {condition3})")
+                
             elif brand:
-                base_query += " AND p.brand ILIKE %s"
+                search_conditions.append("p.brand ILIKE %s")
                 params.append(f'%{brand}%')
             
             if size:
-                base_query += " AND ps.size = %s"
+                search_conditions.append("ps.size = %s")
                 params.append(size)
             
+            if search_conditions:
+                base_query += " AND (" + " AND ".join(search_conditions) + ")"
+            
             base_query += '''
-                ORDER BY l.type DESC, ps.quantity DESC, l.name ASC
+                ORDER BY 
+                    CASE 
+                        WHEN p.description ILIKE %s THEN 1
+                        WHEN p.model ILIKE %s THEN 2
+                        ELSE 3
+                    END,
+                    l.type DESC, ps.quantity DESC, l.name ASC
             '''
             
-            print(f"🔍 [DEBUG] Query: {base_query}")
+            # Parámetros para ordenamiento
+            search_term = f'%{model}%' if model else '%'
+            params.extend([search_term, search_term])
+            
+            print(f"🔍 [DEBUG] Enhanced Query: {base_query}")
             print(f"🔍 [DEBUG] Params: {params}")
             
             cursor.execute(base_query, params)
             results = [dict(row) for row in cursor.fetchall()]
             
-            print(f"✅ [DEBUG] Found {len(results)} results")
+            print(f"✅ [DEBUG] Found {len(results)} results with enhanced search")
             
         else:
-            # SQLite - mantener como estaba
+            # SQLite - lógica similar
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
             
@@ -1266,20 +1303,42 @@ def find_all_locations_with_product(reference_code: str, brand: str = None, mode
             '''
             
             params = []
+            search_conditions = []
             
             if reference_code:
-                base_query += " AND p.reference_code = ?"
+                search_conditions.append("p.reference_code = ?")
                 params.append(reference_code)
             elif brand and model:
-                base_query += " AND (p.brand LIKE ? AND p.model LIKE ?)"
+                # Búsqueda por descripción (más amplia)
+                condition1 = "(p.brand LIKE ? AND p.description LIKE ?)"
                 params.extend([f'%{brand}%', f'%{model}%'])
+                
+                # Búsqueda por términos
+                model_terms = model.lower().split()
+                model_conditions = []
+                for term in model_terms:
+                    if len(term) > 2:
+                        model_conditions.append("p.description LIKE ?")
+                        params.append(f'%{term}%')
+                
+                if model_conditions:
+                    condition2 = f"(p.brand LIKE ? AND ({' AND '.join(model_conditions)}))"
+                    params.insert(-len(model_conditions), f'%{brand}%')
+                else:
+                    condition2 = condition1
+                
+                search_conditions.append(f"({condition1} OR {condition2})")
+                
             elif brand:
-                base_query += " AND p.brand LIKE ?"
+                search_conditions.append("p.brand LIKE ?")
                 params.append(f'%{brand}%')
             
             if size:
-                base_query += " AND ps.size = ?"
+                search_conditions.append("ps.size = ?")
                 params.append(size)
+            
+            if search_conditions:
+                base_query += " AND (" + " AND ".join(search_conditions) + ")"
             
             base_query += '''
                 ORDER BY l.type DESC, ps.quantity DESC, l.name ASC
@@ -1294,10 +1353,12 @@ def find_all_locations_with_product(reference_code: str, brand: str = None, mode
             print(f"⚠️ [DEBUG] No results found for brand='{brand}', model='{model}', reference='{reference_code}'")
             return []
         
-        # Resto del código de procesamiento...
+        # Resto del procesamiento igual...
         locations_with_stock = {}
         
         for result in results:
+            print(f"📍 [DEBUG] Found product: {result['reference_code']} - {result['description']} - Stock: {result['quantity']}")
+            
             location_key = f"{result['location_id']}_{result['reference_code']}"
             
             if location_key not in locations_with_stock:
@@ -1350,7 +1411,7 @@ def find_all_locations_with_product(reference_code: str, brand: str = None, mode
         return final_results
         
     except Exception as e:
-        print(f"❌ [ERROR] find_all_locations_with_product: {str(e)}")
+        print(f"❌ [ERROR] find_all_locations_with_product_improved: {str(e)}")
         print(f"❌ [ERROR] Params were: reference_code='{reference_code}', brand='{brand}', model='{model}', size='{size}'")
         import traceback
         traceback.print_exc()
