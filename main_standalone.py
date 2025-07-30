@@ -6602,12 +6602,8 @@ async def release_product_reservation(
 
 # ==================== ENDPOINTS PARA BODEGUERO ====================
 
-@app.get("/api/v1/warehouse/pending-requests")
-async def get_pending_transfer_requests(current_user = Depends(get_current_user)):
-    """BG001: Recibir y procesar solicitudes de productos - CON IMÁGENES"""
-    
-    if current_user['role'] not in ['bodeguero', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes")
+def get_user_managed_locations(user_id: int, role: str = None) -> list:
+    """Obtener todas las ubicaciones que maneja un usuario"""
     
     if USE_POSTGRESQL:
         import psycopg2
@@ -6615,7 +6611,72 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
         conn = psycopg2.connect(DB_PATH)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        cursor.execute('''
+        query = '''
+            SELECT ula.location_id, l.name as location_name
+            FROM user_location_assignments ula
+            JOIN locations l ON ula.location_id = l.id
+            WHERE ula.user_id = %s AND ula.is_active = TRUE
+        '''
+        params = [user_id]
+        
+        if role:
+            query += ' AND ula.role_at_location = %s'
+            params.append(role)
+            
+        cursor.execute(query, params)
+        locations = [dict(row) for row in cursor.fetchall()]
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        query = '''
+            SELECT ula.location_id, l.name as location_name
+            FROM user_location_assignments ula
+            JOIN locations l ON ula.location_id = l.id
+            WHERE ula.user_id = ? AND ula.is_active = 1
+        '''
+        params = [user_id]
+        
+        if role:
+            query += ' AND ula.role_at_location = ?'
+            params.append(role)
+            
+        cursor = conn.execute(query, params)
+        locations = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    return locations
+
+
+@app.get("/api/v1/warehouse/pending-requests")
+async def get_pending_transfer_requests(current_user = Depends(get_current_user)):
+    """BG001: Recibir y procesar solicitudes de productos - VERSIÓN MÚLTIPLES UBICACIONES"""
+    
+    if current_user['role'] not in ['bodeguero', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes")
+    
+    # ✅ Obtener ubicaciones asignadas al bodeguero
+    managed_locations = get_user_managed_locations(current_user['id'], 'bodeguero')
+    location_ids = [loc['location_id'] for loc in managed_locations]
+    
+    if not location_ids:
+        return {
+            "success": True, 
+            "pending_requests": [], 
+            "count": 0,
+            "message": "No tienes ubicaciones asignadas",
+            "managed_locations": []
+        }
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # ✅ Usar IN para múltiples ubicaciones
+        placeholders = ','.join(['%s'] * len(location_ids))
+        cursor.execute(f'''
             SELECT tr.*, 
                    u.first_name as requester_first_name,
                    u.last_name as requester_last_name,
@@ -6631,17 +6692,18 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
                                    AND p.location_name = sl.name)
             WHERE tr.status = 'pending' 
-            AND sl.id = %s
+            AND sl.id IN ({placeholders})
             ORDER BY 
                 CASE WHEN tr.purpose = 'cliente' THEN 1 ELSE 2 END,
-                tr.requested_at ASC
-        ''', (current_user['location_id'],))
+                sl.name, tr.requested_at ASC
+        ''', location_ids)
         requests = [dict(row) for row in cursor.fetchall()]
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         
-        cursor = conn.execute('''
+        placeholders = ','.join(['?'] * len(location_ids))
+        cursor = conn.execute(f'''
             SELECT tr.*, 
                    u.first_name as requester_first_name,
                    u.last_name as requester_last_name,
@@ -6657,11 +6719,11 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
                                    AND p.location_name = sl.name)
             WHERE tr.status = "pending" 
-            AND sl.id = ?
+            AND sl.id IN ({placeholders})
             ORDER BY 
                 CASE WHEN tr.purpose = "cliente" THEN 1 ELSE 2 END,
-                tr.requested_at ASC
-        ''', (current_user['location_id'],))
+                sl.name, tr.requested_at ASC
+        ''', location_ids)
         requests = [dict(row) for row in cursor.fetchall()]
     
     conn.close()
@@ -6675,12 +6737,11 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             request['source_location_id']
         )
         
-        # Campos que espera el frontend
         request['can_fulfill'] = availability['can_fulfill']
         request['available_stock'] = availability['available_stock']
         request['stock_info'] = availability
         
-        # ✅ NUEVO: Imagen fallback si no hay imagen del producto
+        # Imagen fallback si no hay imagen del producto
         if not request['product_image']:
             request['product_image'] = f"https://via.placeholder.com/300x200?text={request['brand']}+{request['model']}"
     
@@ -6688,19 +6749,24 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
         "success": True,
         "pending_requests": requests,
         "count": len(requests),
-        "urgent_count": len([r for r in requests if r.get('priority') == 'high']),
+        "urgent_count": len([r for r in requests if r.get('purpose') == 'cliente']),
+        "managed_locations": managed_locations,
         "location_info": {
             "bodeguero": f"{current_user['first_name']} {current_user['last_name']}",
-            "location_id": current_user['location_id']
+            "total_locations_managed": len(managed_locations),
+            "location_names": [loc['location_name'] for loc in managed_locations]
         }
     }
 
 @app.get("/api/v1/warehouse/accepted-requests")
 async def get_accepted_transfer_requests(current_user = Depends(get_current_user)):
-    """BG002: Ver solicitudes aceptadas y en preparación - CON IMÁGENES"""
+    """BG002: Ver solicitudes aceptadas y en preparación - VERSIÓN MÚLTIPLES UBICACIONES"""
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes aceptadas")
+    
+    # Obtener ubicaciones gestionadas para información adicional
+    managed_locations = get_user_managed_locations(current_user['id'], 'bodeguero')
     
     if USE_POSTGRESQL:
         import psycopg2
@@ -6788,7 +6854,7 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
             request['action_available'] = False
             request['ready_for_pickup'] = False
         
-        # ✅ NUEVO: Imagen fallback
+        # Imagen fallback
         if not request['product_image']:
             request['product_image'] = f"https://via.placeholder.com/300x200?text={request['brand']}+{request['model']}"
     
@@ -6800,6 +6866,12 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
             "waiting_courier": len([r for r in requests if r['status'] == 'accepted']),
             "courier_assigned": len([r for r in requests if r['status'] == 'courier_assigned']),
             "in_transit": len([r for r in requests if r['status'] == 'in_transit'])
+        },
+        "managed_locations": managed_locations,
+        "bodeguero_info": {
+            "name": f"{current_user['first_name']} {current_user['last_name']}",
+            "total_locations_managed": len(managed_locations),
+            "location_names": [loc['location_name'] for loc in managed_locations]
         }
     }
 
@@ -6809,10 +6881,17 @@ async def accept_transfer_request(
     acceptance: TransferAcceptance,
     current_user = Depends(get_current_user)
 ):
-    """BG002: Confirmar disponibilidad y preparar productos"""
+    """BG002: Confirmar disponibilidad y preparar productos - VERSIÓN MÚLTIPLES UBICACIONES"""
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden aceptar solicitudes")
+    
+    # ✅ Validar que puede gestionar ubicaciones
+    managed_locations = get_user_managed_locations(current_user['id'], 'bodeguero')
+    location_ids = [loc['location_id'] for loc in managed_locations]
+    
+    if not location_ids:
+        raise HTTPException(status_code=403, detail="No tienes ubicaciones asignadas")
     
     if USE_POSTGRESQL:
         import psycopg2
@@ -6820,34 +6899,37 @@ async def accept_transfer_request(
         conn = psycopg2.connect(DB_PATH)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # Verificar que la solicitud existe y es para esta ubicación
-        cursor.execute(
-            '''SELECT * FROM transfer_requests 
-               WHERE id = %s AND source_location_id = %s AND status = 'pending' ''',
-            (acceptance.transfer_request_id, current_user['location_id'])
-        )
+        # ✅ Verificar que la solicitud es de una ubicación que puede gestionar
+        placeholders = ','.join(['%s'] * len(location_ids))
+        cursor.execute(f'''
+            SELECT * FROM transfer_requests 
+            WHERE id = %s AND source_location_id IN ({placeholders}) AND status = 'pending'
+        ''', [acceptance.transfer_request_id] + location_ids)
         request = cursor.fetchone()
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         
-        cursor = conn.execute(
-            '''SELECT * FROM transfer_requests 
-               WHERE id = ? AND source_location_id = ? AND status = "pending" ''',
-            (acceptance.transfer_request_id, current_user['location_id'])
-        )
+        placeholders = ','.join(['?'] * len(location_ids))
+        cursor = conn.execute(f'''
+            SELECT * FROM transfer_requests 
+            WHERE id = ? AND source_location_id IN ({placeholders}) AND status = "pending"
+        ''', [acceptance.transfer_request_id] + location_ids)
         request = cursor.fetchone()
     
     if not request:
         conn.close()
-        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+        raise HTTPException(
+            status_code=404, 
+            detail="Solicitud no encontrada o no autorizada para tus ubicaciones asignadas"
+        )
     
     # Verificar stock disponible
     availability = check_product_availability(
         request['sneaker_reference_code'],
         request['size'],
         request['quantity'],
-        current_user['location_id']
+        request['source_location_id']
     )
     
     if acceptance.accepted and not availability['can_fulfill']:
@@ -6879,13 +6961,22 @@ async def accept_transfer_request(
     conn.commit()
     conn.close()
     
+    # Obtener nombre de la ubicación procesada
+    location_name = next(
+        (loc['location_name'] for loc in managed_locations if loc['location_id'] == request['source_location_id']), 
+        f"Ubicación {request['source_location_id']}"
+    )
+    
     return {
         "success": True,
         "message": f"Solicitud {'aceptada' if acceptance.accepted else 'rechazada'} exitosamente",
         "transfer_request_id": acceptance.transfer_request_id,
         "status": new_status,
+        "processed_by": f"{current_user['first_name']} {current_user['last_name']}",
+        "source_location": location_name,
         "estimated_preparation_time": acceptance.estimated_preparation_time if acceptance.accepted else None,
-        "availability_at_acceptance": availability
+        "availability_at_acceptance": availability,
+        "managed_locations_count": len(managed_locations)
     }
 
 @app.post("/api/v1/warehouse/deliver-to-courier")
