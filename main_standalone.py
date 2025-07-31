@@ -1058,7 +1058,7 @@ def merge_classification_with_inventory(classification_result, user_location_id)
             
             # Extraer marca para display
             if original_brand == 'Unknown':
-                extracted_brand, _ = extract_brand_from_model_enhanced(model_name)
+                extracted_brand, _ = extract_brand_from_model(model_name)
                 display_brand = extracted_brand
                 print(f"🔧 [DEBUG] Extracted brand: '{display_brand}' from '{model_name}'")
             else:
