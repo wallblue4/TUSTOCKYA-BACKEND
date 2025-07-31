@@ -811,16 +811,19 @@ def update_stock_after_sale(items, location_id):
 
 def search_products_in_real_inventory(model_name: str, limit: int = 5):
     """
-    Función original que SÍ funcionaba - RECICLADA
+    Función original con logs detallados
     """
+    print(f"🔍 [DEBUG] search_products_in_real_inventory called with model_name: '{model_name}', limit: {limit}")
+    
     try:
         if USE_POSTGRESQL:
+            print(f"🔍 [DEBUG] Using PostgreSQL connection")
             import psycopg2
             import psycopg2.extras
             conn = psycopg2.connect(DB_PATH)
             cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             
-            cursor.execute('''
+            query = '''
                 SELECT p.*, 
                        STRING_AGG(ps.size || '/' || ps.quantity, ',') as sizes_stock,
                        SUM(ps.quantity) as total_available,
@@ -835,16 +838,22 @@ def search_products_in_real_inventory(model_name: str, limit: int = 5):
                          p.location_name, p.unit_price, p.box_price, p.created_at, p.updated_at
                 ORDER BY SUM(ps.quantity) DESC
                 LIMIT %s
-            ''', (f'%{model_name}%', f'%{model_name}%', f'%{model_name}%', limit))
+            '''
             
+            params = (f'%{model_name}%', f'%{model_name}%', f'%{model_name}%', limit)
+            print(f"🔍 [DEBUG] PostgreSQL Query: {query}")
+            print(f"🔍 [DEBUG] PostgreSQL Params: {params}")
+            
+            cursor.execute(query, params)
             products = [dict(row) for row in cursor.fetchall()]
             cursor.close()
             
         else:
+            print(f"🔍 [DEBUG] Using SQLite connection")
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
             
-            cursor = conn.execute('''
+            query = '''
                 SELECT p.*, 
                        GROUP_CONCAT(ps.size || '/' || ps.quantity) as sizes_stock,
                        SUM(ps.quantity) as total_available,
@@ -857,37 +866,52 @@ def search_products_in_real_inventory(model_name: str, limit: int = 5):
                 GROUP BY p.id
                 ORDER BY total_available DESC
                 LIMIT ?
-            ''', (f'%{model_name}%', f'%{model_name}%', f'%{model_name}%', limit))
+            '''
             
+            params = (f'%{model_name}%', f'%{model_name}%', f'%{model_name}%', limit)
+            print(f"🔍 [DEBUG] SQLite Query: {query}")
+            print(f"🔍 [DEBUG] SQLite Params: {params}")
+            
+            cursor = conn.execute(query, params)
             products = [dict(row) for row in cursor.fetchall()]
         
         conn.close()
         
-        # Procesar datos para formato del API (igual que el original)
-        for product in products:
-            print(f"📍 [DEBUG] Found product: {product['reference_code']} - {product['description']} - Stock: {product.get('total_available', 0)}")
-            
-            # Parsear tallas
-            if product.get('sizes_stock'):
-                size_pairs = product['sizes_stock'].split(',')
-                stock_by_size = []
-                for pair in size_pairs:
-                    if '/' in pair:
-                        size, qty = pair.split('/')
-                        stock_by_size.append({
-                            "size": size,
-                            "quantity_stock": int(qty),
-                            "quantity_exhibition": 0,
-                            "location": product['location_name']
-                        })
-                product['parsed_stock'] = stock_by_size
-            else:
-                product['parsed_stock'] = []
+        print(f"📊 [DEBUG] Query returned {len(products) if products else 0} products")
+        
+        # Log detallado de productos encontrados
+        if products:
+            for i, product in enumerate(products):
+                ref_code = product.get('reference_code', 'NO_CODE')
+                description = product.get('description', 'NO_DESC')
+                total_available = product.get('total_available', 0)
+                print(f"   📦 [DEBUG] Product {i+1}: {ref_code} - {description} - Stock: {total_available}")
+                
+                # Parsear tallas
+                if product.get('sizes_stock'):
+                    size_pairs = product['sizes_stock'].split(',')
+                    stock_by_size = []
+                    for pair in size_pairs:
+                        if '/' in pair:
+                            size, qty = pair.split('/')
+                            stock_by_size.append({
+                                "size": size,
+                                "quantity_stock": int(qty),
+                                "quantity_exhibition": 0,
+                                "location": product.get('location_name', 'Unknown')
+                            })
+                    product['parsed_stock'] = stock_by_size
+                else:
+                    product['parsed_stock'] = []
+        else:
+            print(f"   ❌ [DEBUG] No products found matching '{model_name}'")
         
         return products
         
     except Exception as e:
-        print(f"❌ [ERROR] search_products_in_real_inventory_original: {e}")
+        print(f"❌ [ERROR] search_products_in_real_inventory: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 def get_all_locations_for_reference_code(reference_code: str):
@@ -1005,7 +1029,7 @@ def get_all_locations_for_reference_code(reference_code: str):
 
 def merge_classification_with_inventory(classification_result, user_location_id):
     """
-    Versión HÍBRIDA: Búsqueda original + estructura de ubicaciones completa
+    Versión HÍBRIDA con logs de debug detallados
     """
     if not classification_result or not classification_result.get('results'):
         print("⚠️ [DEBUG] No classification results to process")
@@ -1018,161 +1042,194 @@ def merge_classification_with_inventory(classification_result, user_location_id)
             model_name = result.get('model_name', '')
             original_brand = result.get('brand', 'Unknown')
             
-            print(f"🔍 [DEBUG] Processing result {rank}: model='{model_name}'")
+            print(f"🔍 [DEBUG] Processing result {rank}: model='{model_name}', original_brand='{original_brand}'")
             
-            # ✅ USAR LA BÚSQUEDA ORIGINAL (que funcionaba)
+            # ✅ LLAMAR EXPLÍCITAMENTE A LA BÚSQUEDA ORIGINAL
+            print(f"🔄 [DEBUG] Calling search_products_in_real_inventory with: '{model_name}'")
             real_products = search_products_in_real_inventory(model_name)
+            print(f"📊 [DEBUG] search_products_in_real_inventory returned: {len(real_products) if real_products else 0} products")
             
-            # Extraer marca solo para display si es necesario
+            # Log de los productos encontrados
+            if real_products:
+                for i, product in enumerate(real_products):
+                    print(f"   📦 [DEBUG] Product {i+1}: {product.get('reference_code', 'NO_CODE')} - {product.get('description', 'NO_DESC')}")
+            else:
+                print(f"   ❌ [DEBUG] No products found in search_products_in_real_inventory")
+            
+            # Extraer marca para display
             if original_brand == 'Unknown':
                 extracted_brand, _ = extract_brand_from_model_enhanced(model_name)
                 display_brand = extracted_brand
+                print(f"🔧 [DEBUG] Extracted brand: '{display_brand}' from '{model_name}'")
             else:
                 display_brand = original_brand
+                print(f"✅ [DEBUG] Using original brand: '{display_brand}'")
             
-            if real_products:
-                print(f"✅ [DEBUG] Found {len(real_products)} products with original search")
+            if real_products and len(real_products) > 0:
+                print(f"✅ [DEBUG] FOUND PRODUCTS! Processing first product...")
                 
-                # ✅ USAR EL PRIMER PRODUCTO ENCONTRADO (lógica original)
+                # ✅ USAR EL PRIMER PRODUCTO ENCONTRADO
                 real_product = real_products[0]
-                reference_code = real_product['reference_code']
+                reference_code = real_product.get('reference_code')
                 
-                print(f"📍 [DEBUG] Using product: {reference_code}")
+                print(f"📍 [DEBUG] Selected product: {reference_code}")
+                print(f"📍 [DEBUG] Product details: {real_product}")
                 
-                # ✅ OBTENER TODAS LAS UBICACIONES PARA ESTE REFERENCE_CODE
-                all_locations = get_all_locations_for_reference_code(reference_code)
-                
-                if all_locations:
-                    print(f"✅ [DEBUG] Found {len(all_locations)} locations for {reference_code}")
+                if reference_code:
+                    # ✅ OBTENER TODAS LAS UBICACIONES PARA ESTE REFERENCE_CODE
+                    print(f"🔄 [DEBUG] Getting all locations for reference_code: {reference_code}")
+                    all_locations = get_all_locations_for_reference_code(reference_code)
+                    print(f"📊 [DEBUG] get_all_locations_for_reference_code returned: {len(all_locations) if all_locations else 0} locations")
                     
-                    # ✅ SEPARAR POR UBICACIÓN DEL USUARIO
-                    current_location = []
-                    other_locations = []
-                    
-                    for location_data in all_locations:
-                        if location_data['location_info']['location_id'] == user_location_id:
-                            current_location.append(location_data)
-                            print(f"📍 [DEBUG] Added to current location: {location_data['location_info']['location_name']}")
+                    if all_locations and len(all_locations) > 0:
+                        print(f"✅ [DEBUG] FOUND LOCATIONS! Processing {len(all_locations)} locations...")
+                        
+                        # Log de ubicaciones encontradas
+                        for i, loc in enumerate(all_locations):
+                            loc_id = loc.get('location_info', {}).get('location_id', 'NO_ID')
+                            loc_name = loc.get('location_info', {}).get('location_name', 'NO_NAME')
+                            stock = loc.get('stock_info', {}).get('total_stock', 0)
+                            print(f"   📍 [DEBUG] Location {i+1}: ID={loc_id}, Name='{loc_name}', Stock={stock}")
+                        
+                        # ✅ SEPARAR POR UBICACIÓN DEL USUARIO
+                        current_location = []
+                        other_locations = []
+                        
+                        print(f"🔍 [DEBUG] User location_id: {user_location_id}")
+                        
+                        for location_data in all_locations:
+                            location_id = location_data.get('location_info', {}).get('location_id')
+                            location_name = location_data.get('location_info', {}).get('location_name', 'Unknown')
+                            
+                            print(f"   🔍 [DEBUG] Checking location: ID={location_id}, Name='{location_name}'")
+                            
+                            if location_id == user_location_id:
+                                current_location.append(location_data)
+                                print(f"   ✅ [DEBUG] Added to current_location: {location_name}")
+                            else:
+                                other_locations.append(location_data)
+                                print(f"   📦 [DEBUG] Added to other_locations: {location_name}")
+                        
+                        # ✅ CALCULAR DISPONIBILIDAD
+                        current_stock = sum(loc.get('stock_info', {}).get('total_stock', 0) for loc in current_location)
+                        other_stock = sum(loc.get('stock_info', {}).get('total_stock', 0) for loc in other_locations)
+                        total_stock = current_stock + other_stock
+                        
+                        print(f"📊 [DEBUG] Stock summary:")
+                        print(f"   📍 Current location stock: {current_stock}")
+                        print(f"   📦 Other locations stock: {other_stock}")
+                        print(f"   📊 Total stock: {total_stock}")
+                        
+                        # Tallas disponibles
+                        current_sizes = []
+                        for loc in current_location:
+                            for size_info in loc.get('stock_info', {}).get('available_sizes', []):
+                                if size_info.get('quantity_stock', 0) > 0:
+                                    current_sizes.append(size_info.get('size'))
+                        
+                        other_sizes = []
+                        for loc in other_locations:
+                            for size_info in loc.get('stock_info', {}).get('available_sizes', []):
+                                if size_info.get('quantity_stock', 0) > 0 and size_info.get('size') not in current_sizes:
+                                    other_sizes.append(size_info.get('size'))
+                        
+                        # Determinar acción recomendada
+                        if current_stock > 0:
+                            recommended_action = "✅ Disponible para venta inmediata"
+                            action_type = "sell_immediately"
+                        elif other_stock > 0:
+                            recommended_action = f"📦 Solicitar transferencia ({len(other_locations)} ubicación{'es' if len(other_locations) > 1 else ''} disponible{'s' if len(other_locations) > 1 else ''})"
+                            action_type = "request_transfer"
                         else:
-                            other_locations.append(location_data)
-                            print(f"📍 [DEBUG] Added to other locations: {location_data['location_info']['location_name']}")
-                    
-                    # ✅ CALCULAR DISPONIBILIDAD COMPLETA
-                    current_stock = sum(loc['stock_info']['total_stock'] for loc in current_location)
-                    other_stock = sum(loc['stock_info']['total_stock'] for loc in other_locations)
-                    total_stock = current_stock + other_stock
-                    
-                    print(f"📊 [DEBUG] Stock summary - Current: {current_stock}, Other: {other_stock}, Total: {total_stock}")
-                    
-                    # Tallas disponibles
-                    current_sizes = []
-                    for loc in current_location:
-                        for size_info in loc['stock_info']['available_sizes']:
-                            if size_info['quantity_stock'] > 0:
-                                current_sizes.append(size_info['size'])
-                    
-                    other_sizes = []
-                    for loc in other_locations:
-                        for size_info in loc['stock_info']['available_sizes']:
-                            if size_info['quantity_stock'] > 0 and size_info['size'] not in current_sizes:
-                                other_sizes.append(size_info['size'])
-                    
-                    # Determinar acción recomendada
-                    if current_stock > 0:
-                        recommended_action = "✅ Disponible para venta inmediata"
-                        action_type = "sell_immediately"
-                    elif other_stock > 0:
-                        recommended_action = f"📦 Solicitar transferencia ({len(other_locations)} ubicación{'es' if len(other_locations) > 1 else ''} disponible{'s' if len(other_locations) > 1 else ''})"
-                        action_type = "request_transfer"
-                    else:
-                        recommended_action = "❌ Sin stock en el sistema"
-                        action_type = "out_of_stock"
-                    
-                    print(f"🎯 [DEBUG] Recommended action: {recommended_action}")
-                    
-                    # ✅ USAR DATOS REALES DEL PRODUCTO (igual que original)
-                    merged_result = {
-                        "rank": rank,
-                        "similarity_score": result.get('similarity_score', 0.0),
-                        "confidence_percentage": result.get('confidence_percentage', 0.0),
-                        "confidence_level": result.get('confidence_level', 'low'),
-                        "reference": {
-                            "code": real_product['reference_code'],  # ✅ CÓDIGO REAL (como original)
-                            "brand": display_brand,
-                            "model": model_name,
-                            "color": real_product['color_info'] or "Varios",
-                            "description": real_product['description'],
-                            "photo": real_product['image_url'] or f"https://via.placeholder.com/300x300?text={display_brand}+{model_name}"
-                        },
-                        "availability": {
-                            "summary": {
-                                "current_location": {
-                                    "has_stock": current_stock > 0,
-                                    "total_stock": current_stock,
-                                    "available_sizes": list(set(current_sizes)),
-                                    "locations_count": len(current_location)
-                                },
-                                "other_locations": {
-                                    "has_stock": other_stock > 0,
-                                    "total_stock": other_stock,
-                                    "additional_sizes": list(set(other_sizes)),
-                                    "locations_count": len(other_locations),
-                                    "can_request_transfer": len(other_locations) > 0
-                                },
-                                "total_system": {
-                                    "total_stock": total_stock,
-                                    "total_locations": len(all_locations),
-                                    "all_available_sizes": list(set(current_sizes + other_sizes))
-                                }
+                            recommended_action = "❌ Sin stock en el sistema"
+                            action_type = "out_of_stock"
+                        
+                        print(f"🎯 [DEBUG] Final recommendation: {recommended_action}")
+                        
+                        # ✅ CREAR RESULTADO CON DATOS REALES
+                        merged_result = {
+                            "rank": rank,
+                            "similarity_score": result.get('similarity_score', 0.0),
+                            "confidence_percentage": result.get('confidence_percentage', 0.0),
+                            "confidence_level": result.get('confidence_level', 'low'),
+                            "reference": {
+                                "code": reference_code,  # ✅ CÓDIGO REAL
+                                "brand": display_brand,
+                                "model": model_name,
+                                "color": real_product.get('color_info') or "Varios",
+                                "description": real_product.get('description', f"{display_brand} {model_name}"),
+                                "photo": real_product.get('image_url') or f"https://via.placeholder.com/300x300?text={display_brand}+{model_name}"
                             },
-                            "recommended_action": recommended_action,
-                            "action_type": action_type,
-                            "can_sell_now": current_stock > 0,
-                            "can_request_transfer": other_stock > 0
-                        },
-                        "locations": {
-                            "current_location": current_location,
-                            "other_locations": other_locations,
-                            "total_locations_found": len(all_locations)
-                        },
-                        "pricing": {
-                            "unit_price": float(real_product['unit_price']) if real_product['unit_price'] else 0.0,
-                            "box_price": float(real_product['box_price']) if real_product['box_price'] else 0.0,
-                            "has_pricing": True
-                        },
-                        "classification_source": "real_microservice",
-                        "inventory_source": "found_in_database",
-                        "brand_extraction": {
-                            "original_brand": original_brand,
-                            "final_brand": display_brand,
-                            "extraction_method": "enhanced_analysis" if original_brand == "Unknown" else "microservice_direct"
-                        },
-                        "search_strategy": "original_search_enhanced_locations",
-                        "original_db_id": result.get('original_db_id'),
-                        "image_path": result.get('image_path')
-                    }
-                    
-                    merged_results.append(merged_result)
-                    print(f"✅ [DEBUG] Added result {rank} with REAL reference code: {real_product['reference_code']}")
-                    
+                            "availability": {
+                                "summary": {
+                                    "current_location": {
+                                        "has_stock": current_stock > 0,
+                                        "total_stock": current_stock,
+                                        "available_sizes": list(set(current_sizes)),
+                                        "locations_count": len(current_location)
+                                    },
+                                    "other_locations": {
+                                        "has_stock": other_stock > 0,
+                                        "total_stock": other_stock,
+                                        "additional_sizes": list(set(other_sizes)),
+                                        "locations_count": len(other_locations),
+                                        "can_request_transfer": len(other_locations) > 0
+                                    },
+                                    "total_system": {
+                                        "total_stock": total_stock,
+                                        "total_locations": len(all_locations),
+                                        "all_available_sizes": list(set(current_sizes + other_sizes))
+                                    }
+                                },
+                                "recommended_action": recommended_action,
+                                "action_type": action_type,
+                                "can_sell_now": current_stock > 0,
+                                "can_request_transfer": other_stock > 0
+                            },
+                            "locations": {
+                                "current_location": current_location,
+                                "other_locations": other_locations,
+                                "total_locations_found": len(all_locations)
+                            },
+                            "pricing": {
+                                "unit_price": float(real_product.get('unit_price', 0)),
+                                "box_price": float(real_product.get('box_price', 0)),
+                                "has_pricing": True
+                            },
+                            "classification_source": "real_microservice",
+                            "inventory_source": "found_in_database",
+                            "brand_extraction": {
+                                "original_brand": original_brand,
+                                "final_brand": display_brand,
+                                "extraction_method": "enhanced_analysis" if original_brand == "Unknown" else "microservice_direct"
+                            },
+                            "search_strategy": "original_search_enhanced_locations",
+                            "original_db_id": result.get('original_db_id'),
+                            "image_path": result.get('image_path')
+                        }
+                        
+                        merged_results.append(merged_result)
+                        print(f"✅ [DEBUG] SUCCESS! Added result {rank} with REAL reference code: {reference_code}")
+                        continue  # Ir al siguiente resultado
+                        
+                    else:
+                        print(f"❌ [DEBUG] No locations found for reference_code: {reference_code}")
                 else:
-                    # Producto encontrado pero sin ubicaciones (no debería pasar)
-                    print(f"⚠️ [DEBUG] Product found but no locations for {reference_code}")
-                    merged_result = create_basic_classification_result(rank, result, display_brand, model_name, original_brand)
-                    merged_results.append(merged_result)
-                    
+                    print(f"❌ [DEBUG] No reference_code in real_product")
             else:
-                # ✅ SIN INVENTARIO - usar resultado básico
-                print(f"⚠️ [DEBUG] No inventory found for result {rank}")
-                merged_result = create_basic_classification_result(rank, result, display_brand, model_name, original_brand)
-                merged_results.append(merged_result)
-                print(f"📝 [DEBUG] Added result {rank} as classification-only")
+                print(f"❌ [DEBUG] No real products found, falling back to basic classification")
+            
+            # ✅ FALLBACK: SIN INVENTARIO
+            print(f"📝 [DEBUG] Creating basic classification result for rank {rank}")
+            merged_result = create_basic_classification_result(rank, result, display_brand, model_name, original_brand)
+            merged_results.append(merged_result)
+            print(f"📝 [DEBUG] Added result {rank} as classification-only")
         
         print(f"✅ [DEBUG] Final merged_results count: {len(merged_results)}")
         return merged_results
         
     except Exception as e:
-        print(f"❌ [ERROR] merge_classification_with_inventory_hybrid: {str(e)}")
+        print(f"❌ [ERROR] merge_classification_with_inventory: {str(e)}")
         import traceback
         traceback.print_exc()
         return []
@@ -1256,166 +1313,7 @@ async def call_real_classification_service(image_content: bytes, filename: str):
         print(f"❌ Error llamando microservicio: {e}")
         return None
 
-def merge_classification_with_inventory(classification_result, user_location_id):
-    """
-    Versión COMPLETA que combina simplicidad original + todas las ubicaciones
-    """
-    if not classification_result or not classification_result.get('results'):
-        print("⚠️ [DEBUG] No classification results to process")
-        return []
-    
-    merged_results = []
-    
-    try:
-        for rank, result in enumerate(classification_result['results'][:3], 1):
-            model_name = result.get('model_name', '')
-            original_brand = result.get('brand', 'Unknown')
-            
-            print(f"🔍 [DEBUG] Processing result {rank}: original_brand='{original_brand}', model='{model_name}'")
-            
-            # Extraer marca si es necesario
-            if original_brand == 'Unknown' or not original_brand:
-                extracted_brand, _ = extract_brand_from_model(model_name)
-                display_brand = extracted_brand
-                print(f"🔧 [DEBUG] Extracted brand: '{display_brand}' from model: '{model_name}'")
-            else:
-                display_brand = original_brand
-                print(f"✅ [DEBUG] Using original brand: '{display_brand}'")
-            
-            # ✅ BUSCAR EN TODAS LAS UBICACIONES
-            all_locations = search_products_in_all_locations(model_name, display_brand)
-            
-            if all_locations:
-                print(f"✅ [DEBUG] Found product in {len(all_locations)} location(s)")
-                
-                # ✅ SEPARAR POR UBICACIÓN DEL USUARIO
-                current_location = []
-                other_locations = []
-                
-                for location_data in all_locations:
-                    if location_data['location_info']['location_id'] == user_location_id:
-                        current_location.append(location_data)
-                        print(f"📍 [DEBUG] Added to current location: {location_data['location_info']['location_name']}")
-                    else:
-                        other_locations.append(location_data)
-                        print(f"📍 [DEBUG] Added to other locations: {location_data['location_info']['location_name']}")
-                
-                # ✅ CALCULAR DISPONIBILIDAD COMPLETA
-                current_stock = sum(loc['stock_info']['total_stock'] for loc in current_location)
-                other_stock = sum(loc['stock_info']['total_stock'] for loc in other_locations)
-                total_stock = current_stock + other_stock
-                
-                print(f"📊 [DEBUG] Stock summary - Current: {current_stock}, Other: {other_stock}, Total: {total_stock}")
-                
-                # Tallas disponibles en ubicación actual
-                current_sizes = []
-                for loc in current_location:
-                    for size_info in loc['stock_info']['available_sizes']:
-                        if size_info['quantity_stock'] > 0:
-                            current_sizes.append(size_info['size'])
-                
-                # Tallas adicionales en otras ubicaciones
-                other_sizes = []
-                for loc in other_locations:
-                    for size_info in loc['stock_info']['available_sizes']:
-                        if size_info['quantity_stock'] > 0 and size_info['size'] not in current_sizes:
-                            other_sizes.append(size_info['size'])
-                
-                # Determinar acción recomendada
-                if current_stock > 0:
-                    recommended_action = "✅ Disponible para venta inmediata"
-                    action_type = "sell_immediately"
-                elif other_stock > 0:
-                    recommended_action = f"📦 Solicitar transferencia ({len(other_locations)} ubicación{'es' if len(other_locations) > 1 else ''} disponible{'s' if len(other_locations) > 1 else ''})"
-                    action_type = "request_transfer"
-                else:
-                    recommended_action = "❌ Sin stock en el sistema"
-                    action_type = "out_of_stock"
-                
-                print(f"🎯 [DEBUG] Recommended action: {recommended_action}")
-                
-                # ✅ USAR DATOS DEL PRIMER PRODUCTO ENCONTRADO
-                first_product = current_location[0] if current_location else all_locations[0]
-                
-                merged_result = {
-                    "rank": rank,
-                    "similarity_score": result.get('similarity_score', 0.0),
-                    "confidence_percentage": result.get('confidence_percentage', 0.0),
-                    "confidence_level": result.get('confidence_level', 'low'),
-                    "reference": {
-                        "code": first_product['product_info']['reference_code'],  # ✅ CÓDIGO REAL
-                        "brand": display_brand,
-                        "model": model_name,
-                        "color": first_product['product_info']['color'],
-                        "description": first_product['product_info']['description'],
-                        "photo": first_product['product_info']['image_url']
-                    },
-                    "availability": {
-                        "summary": {
-                            "current_location": {
-                                "has_stock": current_stock > 0,
-                                "total_stock": current_stock,
-                                "available_sizes": list(set(current_sizes)),
-                                "locations_count": len(current_location)
-                            },
-                            "other_locations": {
-                                "has_stock": other_stock > 0,
-                                "total_stock": other_stock,
-                                "additional_sizes": list(set(other_sizes)),
-                                "locations_count": len(other_locations),
-                                "can_request_transfer": len(other_locations) > 0
-                            },
-                            "total_system": {
-                                "total_stock": total_stock,
-                                "total_locations": len(all_locations),
-                                "all_available_sizes": list(set(current_sizes + other_sizes))
-                            }
-                        },
-                        "recommended_action": recommended_action,
-                        "action_type": action_type,
-                        "can_sell_now": current_stock > 0,
-                        "can_request_transfer": other_stock > 0
-                    },
-                    "locations": {
-                        "current_location": current_location,
-                        "other_locations": other_locations,
-                        "total_locations_found": len(all_locations)
-                    },
-                    "pricing": {
-                        "unit_price": first_product['product_info']['unit_price'],
-                        "box_price": first_product['product_info']['box_price'],
-                        "has_pricing": True
-                    },
-                    "classification_source": "real_microservice",
-                    "inventory_source": "found_in_database",
-                    "brand_extraction": {
-                        "original_brand": original_brand,
-                        "final_brand": display_brand,
-                        "extraction_method": "enhanced_analysis" if original_brand == "Unknown" else "microservice_direct"
-                    },
-                    "search_strategy": "simple_effective_complete",
-                    "original_db_id": result.get('original_db_id'),
-                    "image_path": result.get('image_path')
-                }
-                
-                merged_results.append(merged_result)
-                print(f"✅ [DEBUG] Added result {rank} with inventory data")
-                
-            else:
-                # Sin inventario - crear resultado básico
-                print(f"⚠️ [DEBUG] No inventory found for result {rank}, creating classification-only result")
-                merged_result = create_basic_classification_result(rank, result, display_brand, model_name, original_brand)
-                merged_results.append(merged_result)
-                print(f"📝 [DEBUG] Added result {rank} as classification-only")
-        
-        print(f"✅ [DEBUG] Final merged_results count: {len(merged_results)}")
-        return merged_results
-        
-    except Exception as e:
-        print(f"❌ [ERROR] merge_classification_with_inventory: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return []
+
 
 def create_basic_classification_result(rank, original_result, brand, model_name, original_brand):
     """Crear resultado básico cuando no hay inventario pero sí clasificación"""
