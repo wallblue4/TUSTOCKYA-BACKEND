@@ -1122,6 +1122,142 @@ def get_all_locations_for_reference_code(reference_code: str):
         traceback.print_exc()
         return []
 
+def get_all_locations_for_reference_code_case_insensitive(reference_code: str):
+    """
+    Versión que hace JOIN case-insensitive para manejar diferencias de capitalización
+    """
+    print(f"🔍 [DEBUG] get_all_locations_for_reference_code_case_insensitive called with: '{reference_code}'")
+    
+    try:
+        if USE_POSTGRESQL:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # ✅ JOIN CASE-INSENSITIVE usando UPPER() o ILIKE
+            query = '''
+                SELECT p.reference_code, p.brand, p.model, p.description,
+                       p.color_info, p.unit_price, p.box_price, p.image_url,
+                       ps.size, ps.quantity, ps.quantity_exhibition,
+                       l.id as location_id, l.name as location_name,
+                       l.type as location_type, l.address as location_address
+                FROM products p
+                JOIN product_sizes ps ON p.id = ps.product_id
+                JOIN locations l ON UPPER(p.location_name) = UPPER(l.name)
+                WHERE p.reference_code = %s
+                AND p.is_active = 1
+                AND ps.quantity > 0
+                ORDER BY l.id, ps.quantity DESC
+            '''
+            
+            print(f"🔍 [DEBUG] PostgreSQL Case-Insensitive Query: {query}")
+            print(f"🔍 [DEBUG] PostgreSQL Params: ('{reference_code}',)")
+            
+            cursor.execute(query, (reference_code,))
+            results = [dict(row) for row in cursor.fetchall()]
+            cursor.close()
+            
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            
+            # ✅ SQLite case-insensitive JOIN
+            query = '''
+                SELECT p.reference_code, p.brand, p.model, p.description,
+                       p.color_info, p.unit_price, p.box_price, p.image_url,
+                       ps.size, ps.quantity, ps.quantity_exhibition,
+                       l.id as location_id, l.name as location_name,
+                       l.type as location_type, l.address as location_address
+                FROM products p
+                JOIN product_sizes ps ON p.id = ps.product_id
+                JOIN locations l ON UPPER(p.location_name) = UPPER(l.name)
+                WHERE p.reference_code = ?
+                AND p.is_active = 1
+                AND ps.quantity > 0
+                ORDER BY l.id, ps.quantity DESC
+            '''
+            
+            cursor = conn.execute(query, (reference_code,))
+            results = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        print(f"📊 [DEBUG] Case-insensitive query returned {len(results)} raw results")
+        
+        if results:
+            print(f"📍 [DEBUG] Raw results from case-insensitive query:")
+            for i, result in enumerate(results):
+                print(f"   📍 [DEBUG] Result {i+1}: ref={result.get('reference_code')}, location_id={result.get('location_id')}, location_name='{result.get('location_name')}', size={result.get('size')}, qty={result.get('quantity')}")
+        else:
+            print(f"❌ [DEBUG] Still no results even with case-insensitive JOIN")
+            return []
+        
+        # ✅ AGRUPAR POR UBICACIÓN (código existente)
+        locations_map = {}
+        
+        for result in results:
+            location_id = result['location_id']
+            
+            if location_id not in locations_map:
+                locations_map[location_id] = {
+                    "location_info": {
+                        "location_id": result['location_id'],
+                        "location_name": result['location_name'],
+                        "location_type": result['location_type'],
+                        "location_address": result['location_address'] or "Dirección no disponible"
+                    },
+                    "product_info": {
+                        "reference_code": result['reference_code'],
+                        "brand": result['brand'],
+                        "model": result['model'],
+                        "description": result['description'],
+                        "color": result['color_info'] or "Varios",
+                        "unit_price": float(result['unit_price']) if result['unit_price'] else 0.0,
+                        "box_price": float(result['box_price']) if result['box_price'] else 0.0,
+                        "image_url": result['image_url'] or f"https://via.placeholder.com/300x200?text={result['brand']}+{result['model']}"
+                    },
+                    "stock_info": {
+                        "available_sizes": [],
+                        "total_stock": 0,
+                        "total_exhibition": 0,
+                        "size_count": 0
+                    },
+                    "transfer_info": {
+                        "can_request_transfer": True,
+                        "estimated_transfer_time": "2-4 horas" if result['location_type'] == 'local' else "4-8 horas"
+                    }
+                }
+            
+            # Agregar información de talla
+            locations_map[location_id]["stock_info"]["available_sizes"].append({
+                "size": result['size'],
+                "quantity_stock": result['quantity'],
+                "quantity_exhibition": result['quantity_exhibition'] or 0
+            })
+            
+            locations_map[location_id]["stock_info"]["total_stock"] += result['quantity']
+            locations_map[location_id]["stock_info"]["total_exhibition"] += (result['quantity_exhibition'] or 0)
+            locations_map[location_id]["stock_info"]["size_count"] += 1
+        
+        final_results = list(locations_map.values())
+        print(f"✅ [DEBUG] Processed into {len(final_results)} location groups for {reference_code}")
+        
+        # Log de resultados finales
+        for i, loc in enumerate(final_results):
+            loc_id = loc['location_info']['location_id']
+            loc_name = loc['location_info']['location_name']
+            stock = loc['stock_info']['total_stock']
+            print(f"   📍 [DEBUG] Final location {i+1}: ID={loc_id}, Name='{loc_name}', Stock={stock}")
+        
+        return final_results
+        
+    except Exception as e:
+        print(f"❌ [ERROR] get_all_locations_for_reference_code_case_insensitive: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return []
+
 def merge_classification_with_inventory(classification_result, user_location_id):
     """
     Versión HÍBRIDA con logs de debug detallados
@@ -1173,7 +1309,7 @@ def merge_classification_with_inventory(classification_result, user_location_id)
                 if reference_code:
                     # ✅ OBTENER TODAS LAS UBICACIONES PARA ESTE REFERENCE_CODE
                     print(f"🔄 [DEBUG] Getting all locations for reference_code: {reference_code}")
-                    all_locations = get_all_locations_for_reference_code(reference_code)
+                    all_locations = get_all_locations_for_reference_code_case_insensitive(reference_code)
                     print(f"📊 [DEBUG] get_all_locations_for_reference_code returned: {len(all_locations) if all_locations else 0} locations")
                     
                     if all_locations and len(all_locations) > 0:
