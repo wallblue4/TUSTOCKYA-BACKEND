@@ -916,16 +916,19 @@ def search_products_in_real_inventory(model_name: str, limit: int = 5):
 
 def get_all_locations_for_reference_code(reference_code: str):
     """
-    Obtener TODAS las ubicaciones donde está disponible un reference_code específico
+    Obtener TODAS las ubicaciones donde está disponible un reference_code específico - CON LOGS
     """
+    print(f"🔍 [DEBUG] get_all_locations_for_reference_code called with: '{reference_code}'")
+    
     try:
         if USE_POSTGRESQL:
+            print(f"🔍 [DEBUG] Using PostgreSQL for locations lookup")
             import psycopg2
             import psycopg2.extras
             conn = psycopg2.connect(DB_PATH)
             cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             
-            cursor.execute('''
+            query = '''
                 SELECT p.reference_code, p.brand, p.model, p.description,
                        p.color_info, p.unit_price, p.box_price, p.image_url,
                        ps.size, ps.quantity, ps.quantity_exhibition,
@@ -938,15 +941,21 @@ def get_all_locations_for_reference_code(reference_code: str):
                 AND p.is_active = 1
                 AND ps.quantity > 0
                 ORDER BY l.id, ps.quantity DESC
-            ''', (reference_code,))
+            '''
             
+            print(f"🔍 [DEBUG] PostgreSQL Locations Query: {query}")
+            print(f"🔍 [DEBUG] PostgreSQL Locations Params: ('{reference_code}',)")
+            
+            cursor.execute(query, (reference_code,))
             results = [dict(row) for row in cursor.fetchall()]
+            cursor.close()
             
         else:
+            print(f"🔍 [DEBUG] Using SQLite for locations lookup")
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
             
-            cursor = conn.execute('''
+            query = '''
                 SELECT p.reference_code, p.brand, p.model, p.description,
                        p.color_info, p.unit_price, p.box_price, p.image_url,
                        ps.size, ps.quantity, ps.quantity_exhibition,
@@ -959,19 +968,103 @@ def get_all_locations_for_reference_code(reference_code: str):
                 AND p.is_active = 1
                 AND ps.quantity > 0
                 ORDER BY l.id, ps.quantity DESC
-            ''', (reference_code,))
+            '''
             
+            print(f"🔍 [DEBUG] SQLite Locations Query: {query}")
+            print(f"🔍 [DEBUG] SQLite Locations Params: ('{reference_code}',)")
+            
+            cursor = conn.execute(query, (reference_code,))
             results = [dict(row) for row in cursor.fetchall()]
         
         conn.close()
         
-        if not results:
-            print(f"⚠️ [DEBUG] No locations found for reference_code: {reference_code}")
+        print(f"📊 [DEBUG] Locations query returned {len(results)} raw results")
+        
+        if results:
+            print(f"📍 [DEBUG] Raw results from locations query:")
+            for i, result in enumerate(results):
+                print(f"   📍 [DEBUG] Result {i+1}: ref={result.get('reference_code')}, location_id={result.get('location_id')}, location_name='{result.get('location_name')}', size={result.get('size')}, qty={result.get('quantity')}")
+        else:
+            print(f"❌ [DEBUG] No raw results from locations query")
+            
+            # ✅ DIAGNÓSTICO ADICIONAL: Verificar si el problema es el JOIN
+            print(f"🔧 [DEBUG] Testing individual components...")
+            
+            # Test 1: ¿Existe el producto?
+            if USE_POSTGRESQL:
+                conn = psycopg2.connect(DB_PATH)
+                cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+                cursor.execute("SELECT COUNT(*) as count FROM products WHERE reference_code = %s AND is_active = 1", (reference_code,))
+                product_count = cursor.fetchone()['count']
+                print(f"🔧 [DEBUG] Products with reference_code '{reference_code}': {product_count}")
+                
+                # Test 2: ¿Existen los sizes?
+                cursor.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM products p 
+                    JOIN product_sizes ps ON p.id = ps.product_id 
+                    WHERE p.reference_code = %s AND p.is_active = 1 AND ps.quantity > 0
+                """, (reference_code,))
+                sizes_count = cursor.fetchone()['count']
+                print(f"🔧 [DEBUG] Product sizes with stock for '{reference_code}': {sizes_count}")
+                
+                # Test 3: ¿Existe el location?
+                cursor.execute("""
+                    SELECT p.location_name, COUNT(*) as count
+                    FROM products p 
+                    WHERE p.reference_code = %s AND p.is_active = 1
+                    GROUP BY p.location_name
+                """, (reference_code,))
+                location_info = cursor.fetchall()
+                print(f"🔧 [DEBUG] Product location_name for '{reference_code}': {[dict(row) for row in location_info]}")
+                
+                # Test 4: ¿Existe la location en la tabla locations?
+                if location_info:
+                    location_name = location_info[0]['location_name']
+                    cursor.execute("SELECT id, name FROM locations WHERE name = %s", (location_name,))
+                    location_exists = cursor.fetchall()
+                    print(f"🔧 [DEBUG] Location '{location_name}' exists in locations table: {[dict(row) for row in location_exists]}")
+                
+                cursor.close()
+                conn.close()
+            else:
+                # Similar tests for SQLite
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                
+                cursor = conn.execute("SELECT COUNT(*) as count FROM products WHERE reference_code = ? AND is_active = 1", (reference_code,))
+                product_count = cursor.fetchone()['count']
+                print(f"🔧 [DEBUG] Products with reference_code '{reference_code}': {product_count}")
+                
+                cursor = conn.execute("""
+                    SELECT COUNT(*) as count 
+                    FROM products p 
+                    JOIN product_sizes ps ON p.id = ps.product_id 
+                    WHERE p.reference_code = ? AND p.is_active = 1 AND ps.quantity > 0
+                """, (reference_code,))
+                sizes_count = cursor.fetchone()['count']
+                print(f"🔧 [DEBUG] Product sizes with stock for '{reference_code}': {sizes_count}")
+                
+                cursor = conn.execute("""
+                    SELECT p.location_name, COUNT(*) as count
+                    FROM products p 
+                    WHERE p.reference_code = ? AND p.is_active = 1
+                    GROUP BY p.location_name
+                """, (reference_code,))
+                location_info = [dict(row) for row in cursor.fetchall()]
+                print(f"🔧 [DEBUG] Product location_name for '{reference_code}': {location_info}")
+                
+                if location_info:
+                    location_name = location_info[0]['location_name']
+                    cursor = conn.execute("SELECT id, name FROM locations WHERE name = ?", (location_name,))
+                    location_exists = [dict(row) for row in cursor.fetchall()]
+                    print(f"🔧 [DEBUG] Location '{location_name}' exists in locations table: {location_exists}")
+                
+                conn.close()
+            
             return []
         
-        print(f"📍 [DEBUG] Found {len(results)} location entries for {reference_code}")
-        
-        # ✅ AGRUPAR POR UBICACIÓN
+        # ✅ AGRUPAR POR UBICACIÓN (código existente)
         locations_map = {}
         
         for result in results:
@@ -1025,6 +1118,8 @@ def get_all_locations_for_reference_code(reference_code: str):
         
     except Exception as e:
         print(f"❌ [ERROR] get_all_locations_for_reference_code: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return []
 
 def merge_classification_with_inventory(classification_result, user_location_id):
