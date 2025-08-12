@@ -7021,6 +7021,97 @@ async def debug_specific_product_stock(
         debug_result["error"] = str(e)
         return debug_result
 
+def check_product_availability_case_insensitive(sneaker_reference_code: str, size: str, quantity: int, location_id: int):
+    """Versión case-insensitive de check_product_availability - PARA PRODUCCIÓN"""
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Obtener nombre de ubicación
+        cursor.execute("SELECT name FROM locations WHERE id = %s", (location_id,))
+        location_result = cursor.fetchone()
+        location_name = location_result['name'] if location_result else None
+        
+        if not location_name:
+            conn.close()
+            return {"physical_stock": 0, "reserved_quantity": 0, "available_stock": 0, "can_fulfill": False}
+        
+        # ✅ QUERY CASE-INSENSITIVE para stock físico
+        stock_query = '''
+            SELECT ps.quantity 
+            FROM product_sizes ps
+            JOIN products p ON ps.product_id = p.id
+            WHERE p.reference_code = %s AND ps.size = %s 
+            AND UPPER(p.location_name) = UPPER(%s)
+        '''
+        
+        cursor.execute(stock_query, (sneaker_reference_code, size, location_name))
+        stock_result = cursor.fetchone()
+        physical_stock = stock_result['quantity'] if stock_result else 0
+        
+        # Query de reservas (sin cambios)
+        cursor.execute('''
+            SELECT COALESCE(SUM(quantity), 0) as reserved_qty
+            FROM product_reservations 
+            WHERE sneaker_reference_code = %s AND size = %s 
+            AND location_id = %s AND status = 'active'
+            AND expires_at > NOW()
+        ''', (sneaker_reference_code, size, location_id))
+        
+        reserved_result = cursor.fetchone()
+        reserved_qty = reserved_result['reserved_qty'] if reserved_result else 0
+        
+    else:
+        # SQLite version
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute("SELECT name FROM locations WHERE id = ?", (location_id,))
+        location_result = cursor.fetchone()
+        location_name = location_result['name'] if location_result else None
+        
+        if not location_name:
+            conn.close()
+            return {"physical_stock": 0, "reserved_quantity": 0, "available_stock": 0, "can_fulfill": False}
+        
+        # ✅ QUERY CASE-INSENSITIVE para SQLite
+        stock_query = '''
+            SELECT ps.quantity 
+            FROM product_sizes ps
+            JOIN products p ON ps.product_id = p.id
+            WHERE p.reference_code = ? AND ps.size = ? 
+            AND UPPER(p.location_name) = UPPER(?)
+        '''
+        
+        cursor = conn.execute(stock_query, (sneaker_reference_code, size, location_name))
+        stock_result = cursor.fetchone()
+        physical_stock = stock_result['quantity'] if stock_result else 0
+        
+        cursor = conn.execute('''
+            SELECT COALESCE(SUM(quantity), 0) as reserved_qty
+            FROM product_reservations 
+            WHERE sneaker_reference_code = ? AND size = ? 
+            AND location_id = ? AND status = 'active'
+            AND expires_at > datetime('now')
+        ''', (sneaker_reference_code, size, location_id))
+        
+        reserved_result = cursor.fetchone()
+        reserved_qty = reserved_result['reserved_qty'] if reserved_result else 0
+    
+    conn.close()
+    
+    available_stock = physical_stock - reserved_qty
+    
+    return {
+        "physical_stock": physical_stock,
+        "reserved_quantity": reserved_qty,
+        "available_stock": available_stock,
+        "can_fulfill": available_stock >= quantity
+    }
+
 def check_product_availability(sneaker_reference_code: str, size: str, quantity: int, location_id: int):
     """Verificar disponibilidad real considerando reservas activas"""
     
@@ -7386,7 +7477,7 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
     
     # Agregar información de stock y imagen fallback
     for request in requests:
-        availability = check_product_availability(
+        availability = check_product_availability_case_insensitive(
             request['sneaker_reference_code'],
             request['size'],
             request['quantity'],
@@ -7581,7 +7672,7 @@ async def accept_transfer_request(
         )
     
     # Verificar stock disponible
-    availability = check_product_availability(
+    availability = check_product_availability_case_insensitive(
         request['sneaker_reference_code'],
         request['size'],
         request['quantity'],
