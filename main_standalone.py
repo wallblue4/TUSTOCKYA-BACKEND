@@ -6793,6 +6793,235 @@ async def get_implementation_status():
         "status": "active"
     }
 
+@app.get("/api/v1/debug/warehouse/pending-requests")
+async def debug_warehouse_pending_requests(current_user = Depends(get_current_user)):
+    """Versión DEBUG del endpoint de pending requests - PARA DEBUGGING EN PRODUCCIÓN"""
+    
+    if current_user['role'] not in ['bodeguero', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes")
+    
+    debug_response = {
+        "success": True,
+        "debug_timestamp": datetime.now().isoformat(),
+        "user_info": {
+            "id": current_user['id'],
+            "name": f"{current_user['first_name']} {current_user['last_name']}",
+            "role": current_user['role'],
+            "location_id": current_user.get('location_id')
+        },
+        "steps": []
+    }
+    
+    try:
+        # PASO 1: Obtener ubicaciones gestionadas
+        debug_response["steps"].append("=== PASO 1: Verificar ubicaciones gestionadas ===")
+        managed_locations = get_user_managed_locations(current_user['id'], 'bodeguero')
+        location_ids = [loc['location_id'] for loc in managed_locations]
+        
+        debug_response["managed_locations"] = managed_locations
+        debug_response["location_ids"] = location_ids
+        debug_response["steps"].append(f"✅ Ubicaciones gestionadas: {len(managed_locations)}")
+        debug_response["steps"].append(f"📍 IDs: {location_ids}")
+        
+        if not location_ids:
+            debug_response["steps"].append("❌ ERROR: No hay ubicaciones asignadas")
+            debug_response["error"] = "No managed locations found"
+            return debug_response
+        
+        # PASO 2: Buscar solicitudes pendientes
+        debug_response["steps"].append("=== PASO 2: Buscar solicitudes pendientes ===")
+        
+        if USE_POSTGRESQL:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            placeholders = ','.join(['%s'] * len(location_ids))
+            query = f'''
+                SELECT tr.*, 
+                       u.first_name as requester_first_name,
+                       u.last_name as requester_last_name,
+                       sl.name as source_location_name,
+                       dl.name as destination_location_name
+                FROM transfer_requests tr
+                JOIN users u ON tr.requester_id = u.id
+                JOIN locations sl ON tr.source_location_id = sl.id
+                JOIN locations dl ON tr.destination_location_id = dl.id
+                WHERE tr.status = 'pending' 
+                AND sl.id IN ({placeholders})
+                ORDER BY 
+                    CASE WHEN tr.purpose = 'cliente' THEN 1 ELSE 2 END,
+                    sl.name, tr.requested_at ASC
+                LIMIT 5
+            '''
+            debug_response["sql_query"] = query
+            debug_response["sql_params"] = location_ids
+            
+            cursor.execute(query, location_ids)
+            requests = [dict(row) for row in cursor.fetchall()]
+            
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            
+            placeholders = ','.join(['?'] * len(location_ids))
+            query = f'''
+                SELECT tr.*, 
+                       u.first_name as requester_first_name,
+                       u.last_name as requester_last_name,
+                       sl.name as source_location_name,
+                       dl.name as destination_location_name
+                FROM transfer_requests tr
+                JOIN users u ON tr.requester_id = u.id
+                JOIN locations sl ON tr.source_location_id = sl.id
+                JOIN locations dl ON tr.destination_location_id = dl.id
+                WHERE tr.status = "pending" 
+                AND sl.id IN ({placeholders})
+                ORDER BY 
+                    CASE WHEN tr.purpose = "cliente" THEN 1 ELSE 2 END,
+                    sl.name, tr.requested_at ASC
+                LIMIT 5
+            '''
+            debug_response["sql_query"] = query
+            debug_response["sql_params"] = location_ids
+            
+            cursor = conn.execute(query, location_ids)
+            requests = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        debug_response["steps"].append(f"✅ Encontradas {len(requests)} solicitudes pendientes")
+        debug_response["raw_requests"] = requests
+        
+        if not requests:
+            debug_response["steps"].append("⚠️ No hay solicitudes pendientes")
+            debug_response["message"] = "No pending requests found"
+            return debug_response
+        
+        # PASO 3: Debuggear cada solicitud
+        debug_response["steps"].append("=== PASO 3: Debuggear disponibilidad de cada solicitud ===")
+        debug_response["requests_debug"] = []
+        
+        for i, request in enumerate(requests):
+            debug_response["steps"].append(f"--- Debuggeando solicitud {i+1}/{len(requests)} ---")
+            debug_response["steps"].append(f"ID: {request['id']} | Producto: {request['sneaker_reference_code']} | Talla: {request['size']} | Ubicación: {request['source_location_id']}")
+            
+            # Llamar a check_product_availability con debug activado
+            availability_debug = check_product_availability(
+                request['sneaker_reference_code'],
+                request['size'],
+                request['quantity'],
+                request['source_location_id'],
+                debug=True  # ← ACTIVAR DEBUG
+            )
+            
+            request_debug = {
+                "request_id": request['id'],
+                "product_info": {
+                    "reference_code": request['sneaker_reference_code'],
+                    "brand": request['brand'],
+                    "model": request['model'],
+                    "size": request['size'],
+                    "quantity": request['quantity']
+                },
+                "location_info": {
+                    "source_location_id": request['source_location_id'],
+                    "source_location_name": request['source_location_name']
+                },
+                "availability_result": availability_debug,
+                "can_fulfill": availability_debug.get('can_fulfill', False),
+                "available_stock": availability_debug.get('available_stock', 0)
+            }
+            
+            debug_response["requests_debug"].append(request_debug)
+            debug_response["steps"].append(f"✅ Resultado: can_fulfill={availability_debug.get('can_fulfill')}, stock={availability_debug.get('available_stock')}")
+        
+        # PASO 4: Resumen
+        debug_response["steps"].append("=== PASO 4: Resumen final ===")
+        
+        total_requests = len(requests)
+        can_fulfill_count = sum(1 for req in debug_response["requests_debug"] if req["can_fulfill"])
+        cannot_fulfill_count = total_requests - can_fulfill_count
+        
+        debug_response["summary"] = {
+            "total_pending_requests": total_requests,
+            "can_fulfill": can_fulfill_count,
+            "cannot_fulfill": cannot_fulfill_count,
+            "urgent_requests": len([r for r in requests if r.get('purpose') == 'cliente'])
+        }
+        
+        debug_response["steps"].append(f"📊 Total solicitudes: {total_requests}")
+        debug_response["steps"].append(f"✅ Puede cumplir: {can_fulfill_count}")
+        debug_response["steps"].append(f"❌ NO puede cumplir: {cannot_fulfill_count}")
+        
+        # PASO 5: Foco en NK-ZOO-005 si existe
+        nk_zoo_requests = [r for r in debug_response["requests_debug"] if r["product_info"]["reference_code"] == "NK-ZOO-005"]
+        if nk_zoo_requests:
+            debug_response["steps"].append("=== PASO 5: FOCO EN NK-ZOO-005 ===")
+            debug_response["nk_zoo_005_debug"] = nk_zoo_requests
+            debug_response["steps"].append(f"🔍 Encontradas {len(nk_zoo_requests)} solicitudes de NK-ZOO-005")
+            
+            for nk_req in nk_zoo_requests:
+                debug_response["steps"].append(f"🔍 NK-ZOO-005 talla {nk_req['product_info']['size']}: stock={nk_req['available_stock']}")
+        
+        debug_response["steps"].append("=== DEBUG COMPLETADO ===")
+        
+        return debug_response
+        
+    except Exception as e:
+        debug_response["steps"].append(f"❌ ERROR DURANTE DEBUG: {str(e)}")
+        debug_response["error"] = {
+            "message": str(e),
+            "type": type(e).__name__
+        }
+        
+        import traceback
+        debug_response["traceback"] = traceback.format_exc()
+        
+        return debug_response
+
+
+@app.get("/api/v1/debug/product-stock/{reference_code}")
+async def debug_specific_product_stock(
+    reference_code: str,
+    size: str,
+    location_id: int,
+    quantity: int = 1,
+    current_user = Depends(get_current_user)
+):
+    """Debug de un producto específico"""
+    
+    debug_result = {
+        "success": True,
+        "debug_timestamp": datetime.now().isoformat(),
+        "input": {
+            "reference_code": reference_code,
+            "size": size,
+            "location_id": location_id,
+            "quantity": quantity
+        }
+    }
+    
+    try:
+        # Llamar a la función con debug activado
+        availability = check_product_availability(
+            reference_code,
+            size,
+            quantity,
+            location_id,
+            debug=True
+        )
+        
+        debug_result["availability_result"] = availability
+        
+        return debug_result
+        
+    except Exception as e:
+        debug_result["success"] = False
+        debug_result["error"] = str(e)
+        return debug_result
+
 def check_product_availability(sneaker_reference_code: str, size: str, quantity: int, location_id: int):
     """Verificar disponibilidad real considerando reservas activas"""
     
@@ -8172,6 +8401,307 @@ async def debug_cloudinary_manual():
             "type": type(e).__name__
         }
 
+
+@app.get("/api/v1/debug/product-availability/{reference_code}")
+async def debug_product_availability(
+    reference_code: str,
+    size: str,
+    location_id: int,
+    quantity: int = 1,
+    current_user = Depends(get_current_user)
+):
+    """Debug detallado de check_product_availability"""
+    
+    debug_info = {
+        "input_parameters": {
+            "reference_code": reference_code,
+            "size": size,
+            "location_id": location_id,
+            "quantity": quantity
+        },
+        "database_type": "PostgreSQL" if USE_POSTGRESQL else "SQLite",
+        "debug_steps": []
+    }
+    
+    try:
+        if USE_POSTGRESQL:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # PASO 1: Verificar si existe la ubicación
+            debug_info["debug_steps"].append("=== PASO 1: Verificar ubicación ===")
+            cursor.execute("SELECT id, name FROM locations WHERE id = %s", (location_id,))
+            location = cursor.fetchone()
+            debug_info["location_info"] = dict(location) if location else None
+            debug_info["debug_steps"].append(f"Location query result: {debug_info['location_info']}")
+            
+            if not location:
+                debug_info["error"] = f"Location ID {location_id} no existe"
+                return debug_info
+                
+            location_name = location['name']
+            
+            # PASO 2: Buscar productos con ese reference_code
+            debug_info["debug_steps"].append("=== PASO 2: Buscar productos ===")
+            cursor.execute("""
+                SELECT p.id, p.reference_code, p.location_name, p.brand, p.model, p.is_active
+                FROM products p 
+                WHERE p.reference_code = %s
+            """, (reference_code,))
+            all_products = [dict(row) for row in cursor.fetchall()]
+            debug_info["all_products_with_reference"] = all_products
+            debug_info["debug_steps"].append(f"Found {len(all_products)} products with reference {reference_code}")
+            
+            # PASO 3: Filtrar por ubicación
+            debug_info["debug_steps"].append("=== PASO 3: Filtrar por ubicación ===")
+            cursor.execute("""
+                SELECT p.id, p.reference_code, p.location_name, p.brand, p.model, p.is_active
+                FROM products p 
+                WHERE p.reference_code = %s AND p.location_name = %s
+            """, (reference_code, location_name))
+            products_in_location = [dict(row) for row in cursor.fetchall()]
+            debug_info["products_in_target_location"] = products_in_location
+            debug_info["debug_steps"].append(f"Found {len(products_in_location)} products in location '{location_name}'")
+            
+            if not products_in_location:
+                debug_info["warning"] = f"Producto {reference_code} no existe en ubicación '{location_name}'"
+                debug_info["suggestion"] = f"Ubicaciones disponibles: {[p['location_name'] for p in all_products]}"
+            
+            # PASO 4: Buscar tallas para cada producto en la ubicación
+            debug_info["debug_steps"].append("=== PASO 4: Verificar tallas ===")
+            for product in products_in_location:
+                cursor.execute("""
+                    SELECT ps.id, ps.size, ps.quantity, ps.quantity_exhibition
+                    FROM product_sizes ps
+                    WHERE ps.product_id = %s
+                """, (product['id'],))
+                sizes = [dict(row) for row in cursor.fetchall()]
+                product['available_sizes'] = sizes
+                debug_info["debug_steps"].append(f"Product ID {product['id']} has sizes: {[s['size'] for s in sizes]}")
+            
+            # PASO 5: Query exacta de stock físico (la misma que usa check_product_availability)
+            debug_info["debug_steps"].append("=== PASO 5: Query exacta de stock físico ===")
+            stock_query = '''
+                SELECT ps.quantity, ps.id as size_id, p.id as product_id, p.location_name
+                FROM product_sizes ps
+                JOIN products p ON ps.product_id = p.id
+                WHERE p.reference_code = %s AND ps.size = %s 
+                AND p.location_name = (SELECT name FROM locations WHERE id = %s)
+            '''
+            debug_info["stock_query"] = stock_query
+            debug_info["stock_query_params"] = [reference_code, size, location_id]
+            
+            cursor.execute(stock_query, (reference_code, size, location_id))
+            stock_result = cursor.fetchone()
+            debug_info["stock_query_result"] = dict(stock_result) if stock_result else None
+            physical_stock = stock_result['quantity'] if stock_result else 0
+            
+            # PASO 6: Query de reservas activas
+            debug_info["debug_steps"].append("=== PASO 6: Query de reservas activas ===")
+            reservations_query = '''
+                SELECT id, quantity, status, expires_at, user_id, purpose
+                FROM product_reservations 
+                WHERE sneaker_reference_code = %s AND size = %s 
+                AND location_id = %s AND status = 'active'
+                AND expires_at > NOW()
+            '''
+            debug_info["reservations_query"] = reservations_query
+            debug_info["reservations_query_params"] = [reference_code, size, location_id]
+            
+            cursor.execute(reservations_query, (reference_code, size, location_id))
+            reservations = [dict(row) for row in cursor.fetchall()]
+            debug_info["active_reservations"] = reservations
+            reserved_qty = sum(r['quantity'] for r in reservations)
+            
+        else:
+            # Similar para SQLite
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            
+            debug_info["debug_steps"].append("=== PASO 1: Verificar ubicación (SQLite) ===")
+            cursor = conn.execute("SELECT id, name FROM locations WHERE id = ?", (location_id,))
+            location = cursor.fetchone()
+            debug_info["location_info"] = dict(location) if location else None
+            
+            if not location:
+                debug_info["error"] = f"Location ID {location_id} no existe"
+                return debug_info
+                
+            location_name = location['name']
+            
+            # Resto de queries similares pero con ? en lugar de %s
+            # ... (código similar adaptado para SQLite)
+        
+        # PASO 7: Cálculo final
+        debug_info["debug_steps"].append("=== PASO 7: Cálculo final ===")
+        available_stock = physical_stock - reserved_qty
+        can_fulfill = available_stock >= quantity
+        
+        final_result = {
+            "physical_stock": physical_stock,
+            "reserved_quantity": reserved_qty,
+            "available_stock": available_stock,
+            "can_fulfill": can_fulfill
+        }
+        
+        debug_info["final_calculation"] = final_result
+        debug_info["debug_steps"].append(f"Final result: {final_result}")
+        
+        # PASO 8: Llamar a la función real para comparar
+        debug_info["debug_steps"].append("=== PASO 8: Comparar con función real ===")
+        real_result = check_product_availability(reference_code, size, quantity, location_id)
+        debug_info["real_function_result"] = real_result
+        debug_info["results_match"] = final_result == real_result
+        
+        conn.close()
+        
+        return {
+            "success": True,
+            "debug_info": debug_info
+        }
+        
+    except Exception as e:
+        debug_info["error"] = str(e)
+        debug_info["error_type"] = type(e).__name__
+        return {
+            "success": False,
+            "debug_info": debug_info
+        }
+
+
+@app.get("/api/v1/debug/all-references")
+async def debug_all_references(current_user = Depends(get_current_user)):
+    """Ver todas las referencias que existen en la BD"""
+    
+    try:
+        if USE_POSTGRESQL:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            cursor.execute("""
+                SELECT DISTINCT p.reference_code, p.brand, p.model, p.location_name,
+                       COUNT(ps.id) as total_sizes,
+                       SUM(ps.quantity) as total_stock,
+                       l.id as location_id
+                FROM products p
+                LEFT JOIN product_sizes ps ON p.id = ps.product_id
+                LEFT JOIN locations l ON p.location_name = l.name
+                WHERE p.is_active = TRUE
+                GROUP BY p.reference_code, p.brand, p.model, p.location_name, l.id
+                ORDER BY p.reference_code, p.location_name
+            """)
+            references = [dict(row) for row in cursor.fetchall()]
+            
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            
+            cursor = conn.execute("""
+                SELECT DISTINCT p.reference_code, p.brand, p.model, p.location_name,
+                       COUNT(ps.id) as total_sizes,
+                       SUM(ps.quantity) as total_stock,
+                       l.id as location_id
+                FROM products p
+                LEFT JOIN product_sizes ps ON p.id = ps.product_id
+                LEFT JOIN locations l ON p.location_name = l.name
+                WHERE p.is_active = 1
+                GROUP BY p.reference_code, p.brand, p.model, p.location_name, l.id
+                ORDER BY p.reference_code, p.location_name
+            """)
+            references = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return {
+            "success": True,
+            "total_references": len(references),
+            "references": references,
+            "nk_zoo_005_locations": [r for r in references if r['reference_code'] == 'NK-ZOO-005']
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/api/v1/debug/locations-mapping")
+async def debug_locations_mapping(current_user = Depends(get_current_user)):
+    """Debug del mapeo de ubicaciones"""
+    
+    try:
+        if USE_POSTGRESQL:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            # Todas las ubicaciones
+            cursor.execute("SELECT * FROM locations ORDER BY id")
+            all_locations = [dict(row) for row in cursor.fetchall()]
+            
+            # Productos por ubicación
+            cursor.execute("""
+                SELECT p.location_name, COUNT(*) as product_count, l.id as location_id
+                FROM products p
+                LEFT JOIN locations l ON p.location_name = l.name
+                GROUP BY p.location_name, l.id
+                ORDER BY p.location_name
+            """)
+            products_per_location = [dict(row) for row in cursor.fetchall()]
+            
+            # Ubicaciones huérfanas (productos sin ubicación válida)
+            cursor.execute("""
+                SELECT DISTINCT p.location_name
+                FROM products p
+                LEFT JOIN locations l ON p.location_name = l.name
+                WHERE l.id IS NULL
+            """)
+            orphan_locations = [row['location_name'] for row in cursor.fetchall()]
+            
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            
+            cursor = conn.execute("SELECT * FROM locations ORDER BY id")
+            all_locations = [dict(row) for row in cursor.fetchall()]
+            
+            cursor = conn.execute("""
+                SELECT p.location_name, COUNT(*) as product_count, l.id as location_id
+                FROM products p
+                LEFT JOIN locations l ON p.location_name = l.name
+                GROUP BY p.location_name, l.id
+                ORDER BY p.location_name
+            """)
+            products_per_location = [dict(row) for row in cursor.fetchall()]
+            
+            cursor = conn.execute("""
+                SELECT DISTINCT p.location_name
+                FROM products p
+                LEFT JOIN locations l ON p.location_name = l.name
+                WHERE l.id IS NULL
+            """)
+            orphan_locations = [row['location_name'] for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return {
+            "success": True,
+            "all_locations": all_locations,
+            "products_per_location": products_per_location,
+            "orphan_locations": orphan_locations,
+            "location_name_discrepancies": len(orphan_locations) > 0
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 # ==================== INICIALIZACIÓN DE BD ====================
 
