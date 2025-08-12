@@ -6990,7 +6990,7 @@ async def debug_specific_product_stock(
     quantity: int = 1,
     current_user = Depends(get_current_user)
 ):
-    """Debug de un producto específico"""
+    """Debug de un producto específico - VERSIÓN CORREGIDA"""
     
     debug_result = {
         "success": True,
@@ -7004,13 +7004,12 @@ async def debug_specific_product_stock(
     }
     
     try:
-        # Llamar a la función con debug activado
-        availability = check_product_availability(
+        # Usar la nueva función de debug
+        availability = check_product_availability_debug(
             reference_code,
             size,
             quantity,
-            location_id,
-            debug=True
+            location_id
         )
         
         debug_result["availability_result"] = availability
@@ -8570,6 +8569,287 @@ async def debug_product_availability(
             "debug_info": debug_info
         }
 
+def check_product_availability_debug(sneaker_reference_code: str, size: str, quantity: int, location_id: int):
+    """Versión de debug de check_product_availability - NO modifica la función original"""
+    
+    debug_info = {
+        "function": "check_product_availability_debug",
+        "input_params": {
+            "sneaker_reference_code": sneaker_reference_code,
+            "size": size,
+            "quantity": quantity,
+            "location_id": location_id
+        },
+        "steps": [],
+        "queries": [],
+        "database_type": "PostgreSQL" if USE_POSTGRESQL else "SQLite"
+    }
+    
+    try:
+        if USE_POSTGRESQL:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(DB_PATH)
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            debug_info["steps"].append("✅ Connected to PostgreSQL")
+            
+            # PASO 1: Obtener nombre de ubicación
+            location_query = "SELECT id, name FROM locations WHERE id = %s"
+            debug_info["queries"].append({
+                "step": "get_location_name",
+                "query": location_query,
+                "params": [location_id]
+            })
+            
+            cursor.execute(location_query, (location_id,))
+            location_result = cursor.fetchone()
+            location_name = location_result['name'] if location_result else None
+            
+            debug_info["location_query_result"] = dict(location_result) if location_result else None
+            debug_info["steps"].append(f"📍 Location ID {location_id} → Name: '{location_name}'")
+            
+            if not location_name:
+                debug_info["steps"].append(f"❌ ERROR: Location ID {location_id} not found")
+                return {
+                    "physical_stock": 0,
+                    "reserved_quantity": 0,
+                    "available_stock": 0,
+                    "can_fulfill": False,
+                    "debug_info": debug_info,
+                    "error": f"Location {location_id} not found"
+                }
+            
+            # PASO 2: Verificar si existe el producto en cualquier ubicación
+            debug_info["steps"].append("=== PASO 2: Verificar productos existentes ===")
+            all_products_query = "SELECT id, reference_code, location_name, brand, model, is_active FROM products WHERE reference_code = %s"
+            cursor.execute(all_products_query, (sneaker_reference_code,))
+            all_products = [dict(row) for row in cursor.fetchall()]
+            debug_info["all_products_found"] = all_products
+            debug_info["steps"].append(f"🔍 Productos encontrados con referencia '{sneaker_reference_code}': {len(all_products)}")
+            
+            if all_products:
+                debug_info["steps"].append("📋 Detalle de productos encontrados:")
+                for i, prod in enumerate(all_products):
+                    debug_info["steps"].append(f"   {i+1}. ID: {prod['id']}, Ubicación: '{prod['location_name']}', Activo: {prod['is_active']}")
+            else:
+                debug_info["steps"].append("❌ NO se encontraron productos con esa referencia")
+                return {
+                    "physical_stock": 0,
+                    "reserved_quantity": 0,
+                    "available_stock": 0,
+                    "can_fulfill": False,
+                    "debug_info": debug_info,
+                    "error": f"Product {sneaker_reference_code} not found in database"
+                }
+            
+            # PASO 3: Verificar productos en la ubicación específica
+            debug_info["steps"].append("=== PASO 3: Verificar productos en ubicación específica ===")
+            location_products_query = "SELECT id, reference_code, location_name, brand, model, is_active FROM products WHERE reference_code = %s AND location_name = %s"
+            cursor.execute(location_products_query, (sneaker_reference_code, location_name))
+            location_products = [dict(row) for row in cursor.fetchall()]
+            debug_info["products_in_target_location"] = location_products
+            debug_info["steps"].append(f"🔍 Productos en ubicación '{location_name}': {len(location_products)}")
+            
+            if not location_products:
+                debug_info["steps"].append(f"❌ Producto '{sneaker_reference_code}' NO existe en ubicación '{location_name}'")
+                available_locations = [p['location_name'] for p in all_products]
+                debug_info["steps"].append(f"📍 Ubicaciones disponibles para este producto: {available_locations}")
+                return {
+                    "physical_stock": 0,
+                    "reserved_quantity": 0,
+                    "available_stock": 0,
+                    "can_fulfill": False,
+                    "debug_info": debug_info,
+                    "suggestion": f"Product exists in: {available_locations}"
+                }
+            
+            # PASO 4: Verificar tallas disponibles
+            debug_info["steps"].append("=== PASO 4: Verificar tallas disponibles ===")
+            product_id = location_products[0]['id']
+            sizes_query = "SELECT id, size, quantity, quantity_exhibition FROM product_sizes WHERE product_id = %s"
+            cursor.execute(sizes_query, (product_id,))
+            all_sizes = [dict(row) for row in cursor.fetchall()]
+            debug_info["all_sizes_for_product"] = all_sizes
+            debug_info["steps"].append(f"🔍 Tallas disponibles para producto ID {product_id}: {len(all_sizes)}")
+            
+            if all_sizes:
+                debug_info["steps"].append("📋 Detalle de tallas:")
+                for size_info in all_sizes:
+                    debug_info["steps"].append(f"   Talla: {size_info['size']}, Stock: {size_info['quantity']}, Exhibición: {size_info['quantity_exhibition']}")
+            else:
+                debug_info["steps"].append("❌ NO hay tallas registradas para este producto")
+                return {
+                    "physical_stock": 0,
+                    "reserved_quantity": 0,
+                    "available_stock": 0,
+                    "can_fulfill": False,
+                    "debug_info": debug_info,
+                    "error": "No sizes found for this product"
+                }
+            
+            # PASO 5: Query exacta de stock físico (la misma que usa check_product_availability)
+            debug_info["steps"].append("=== PASO 5: Query exacta de stock físico ===")
+            stock_query = '''
+                SELECT ps.quantity, ps.id as size_id, p.id as product_id, p.location_name
+                FROM product_sizes ps
+                JOIN products p ON ps.product_id = p.id
+                WHERE p.reference_code = %s AND ps.size = %s 
+                AND p.location_name = %s
+            '''
+            debug_info["stock_query"] = stock_query
+            debug_info["stock_query_params"] = [sneaker_reference_code, size, location_name]
+            
+            cursor.execute(stock_query, (sneaker_reference_code, size, location_name))
+            stock_result = cursor.fetchone()
+            debug_info["stock_query_result"] = dict(stock_result) if stock_result else None
+            physical_stock = stock_result['quantity'] if stock_result else 0
+            
+            debug_info["steps"].append(f"📦 Stock query result: {dict(stock_result) if stock_result else 'NULL'}")
+            debug_info["steps"].append(f"📦 Physical stock: {physical_stock}")
+            
+            if physical_stock == 0 and stock_result is None:
+                debug_info["steps"].append(f"❌ Talla '{size}' NO encontrada para el producto en esta ubicación")
+                available_sizes = [s['size'] for s in all_sizes]
+                debug_info["steps"].append(f"📏 Tallas disponibles: {available_sizes}")
+            
+            # PASO 6: Query de reservas activas
+            debug_info["steps"].append("=== PASO 6: Query de reservas activas ===")
+            reservations_query = '''
+                SELECT id, quantity, status, expires_at, user_id, purpose
+                FROM product_reservations 
+                WHERE sneaker_reference_code = %s AND size = %s 
+                AND location_id = %s AND status = 'active'
+                AND expires_at > NOW()
+            '''
+            debug_info["reservations_query"] = reservations_query
+            debug_info["reservations_query_params"] = [sneaker_reference_code, size, location_id]
+            
+            cursor.execute(reservations_query, (sneaker_reference_code, size, location_id))
+            reservations = [dict(row) for row in cursor.fetchall()]
+            debug_info["active_reservations"] = reservations
+            reserved_qty = sum(r['quantity'] for r in reservations)
+            
+            debug_info["steps"].append(f"🔒 Reservas activas encontradas: {len(reservations)}")
+            debug_info["steps"].append(f"🔒 Cantidad total reservada: {reserved_qty}")
+            
+        else:
+            # Lógica similar para SQLite
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            
+            debug_info["steps"].append("✅ Connected to SQLite")
+            
+            # Implementar la misma lógica pero con SQLite syntax
+            # (código similar al PostgreSQL pero con ? en lugar de %s)
+            
+            cursor = conn.execute("SELECT id, name FROM locations WHERE id = ?", (location_id,))
+            location_result = cursor.fetchone()
+            location_name = location_result['name'] if location_result else None
+            
+            debug_info["steps"].append(f"📍 Location ID {location_id} → Name: '{location_name}'")
+            
+            if not location_name:
+                return {
+                    "physical_stock": 0,
+                    "reserved_quantity": 0,
+                    "available_stock": 0,
+                    "can_fulfill": False,
+                    "debug_info": debug_info,
+                    "error": f"Location {location_id} not found"
+                }
+            
+            # Continuar con la misma lógica...
+            cursor = conn.execute("SELECT id, reference_code, location_name, brand, model, is_active FROM products WHERE reference_code = ?", (sneaker_reference_code,))
+            all_products = [dict(row) for row in cursor.fetchall()]
+            debug_info["all_products_found"] = all_products
+            
+            if not all_products:
+                return {
+                    "physical_stock": 0,
+                    "reserved_quantity": 0,
+                    "available_stock": 0,
+                    "can_fulfill": False,
+                    "debug_info": debug_info,
+                    "error": f"Product {sneaker_reference_code} not found"
+                }
+            
+            # Stock físico
+            stock_query = '''
+                SELECT ps.quantity, ps.id as size_id, p.id as product_id, p.location_name
+                FROM product_sizes ps
+                JOIN products p ON ps.product_id = p.id
+                WHERE p.reference_code = ? AND ps.size = ? 
+                AND p.location_name = ?
+            '''
+            cursor = conn.execute(stock_query, (sneaker_reference_code, size, location_name))
+            stock_result = cursor.fetchone()
+            physical_stock = stock_result['quantity'] if stock_result else 0
+            
+            debug_info["stock_query_result"] = dict(stock_result) if stock_result else None
+            debug_info["steps"].append(f"📦 Physical stock: {physical_stock}")
+            
+            # Reservas
+            cursor = conn.execute('''
+                SELECT id, quantity, status, expires_at, user_id, purpose
+                FROM product_reservations 
+                WHERE sneaker_reference_code = ? AND size = ? 
+                AND location_id = ? AND status = 'active'
+                AND expires_at > datetime('now')
+            ''', (sneaker_reference_code, size, location_id))
+            reservations = [dict(row) for row in cursor.fetchall()]
+            reserved_qty = sum(r['quantity'] for r in reservations)
+            
+            debug_info["active_reservations"] = reservations
+            debug_info["steps"].append(f"🔒 Reserved quantity: {reserved_qty}")
+        
+        conn.close()
+        debug_info["steps"].append("✅ Database connection closed")
+        
+        # PASO 7: Cálculo final
+        available_stock = physical_stock - reserved_qty
+        can_fulfill = available_stock >= quantity
+        
+        debug_info["steps"].append("=== PASO 7: Cálculo final ===")
+        debug_info["steps"].append(f"📦 Physical stock: {physical_stock}")
+        debug_info["steps"].append(f"🔒 Reserved quantity: {reserved_qty}")
+        debug_info["steps"].append(f"✅ Available stock: {available_stock}")
+        debug_info["steps"].append(f"✅ Can fulfill {quantity}: {can_fulfill}")
+        
+        # Comparar con función original
+        debug_info["steps"].append("=== PASO 8: Comparar con función original ===")
+        try:
+            original_result = check_product_availability(sneaker_reference_code, size, quantity, location_id)
+            debug_info["original_function_result"] = original_result
+            debug_info["steps"].append(f"🔄 Función original retorna: {original_result}")
+        except Exception as e:
+            debug_info["original_function_error"] = str(e)
+            debug_info["steps"].append(f"❌ Error en función original: {e}")
+        
+        return {
+            "physical_stock": physical_stock,
+            "reserved_quantity": reserved_qty,
+            "available_stock": available_stock,
+            "can_fulfill": can_fulfill,
+            "debug_info": debug_info
+        }
+        
+    except Exception as e:
+        debug_info["steps"].append(f"❌ ERROR: {str(e)}")
+        debug_info["error"] = str(e)
+        debug_info["error_type"] = type(e).__name__
+        
+        import traceback
+        debug_info["traceback"] = traceback.format_exc()
+        
+        return {
+            "physical_stock": 0,
+            "reserved_quantity": 0,
+            "available_stock": 0,
+            "can_fulfill": False,
+            "debug_info": debug_info,
+            "error": str(e)
+        }
 
 @app.get("/api/v1/debug/all-references")
 async def debug_all_references(current_user = Depends(get_current_user)):
