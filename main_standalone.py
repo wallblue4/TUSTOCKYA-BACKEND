@@ -7437,7 +7437,7 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
-                                   AND p.location_name = sl.name)
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
             WHERE tr.status = 'pending' 
             AND sl.id IN ({placeholders})
             ORDER BY 
