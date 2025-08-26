@@ -4999,19 +4999,6 @@ async def get_pending_receptions(current_user = Depends(get_current_user)):
 async def get_pending_transfers(current_user = Depends(get_current_user)):
     """
     VE003 Extendido: Ver todas las solicitudes de transferencia que no han finalizado
-    
-    Estados considerados como "pendientes":
-    - pending: Esperando aceptación del bodeguero
-    - accepted: Aceptada por bodeguero, esperando corredor
-    - courier_assigned: Corredor asignado, esperando recolección
-    - in_transit: En camino al destino
-    - delivered: Entregada, esperando confirmación del vendedor
-    
-    Estados NO incluidos (finalizados):
-    - completed: Confirmada por vendedor (finalizada exitosamente)
-    - cancelled: Cancelada
-    - delivery_failed: Entrega fallida
-    - reception_issues: Problemas en recepción
     """
     
     if current_user['role'] not in ['seller', 'administrador']:
@@ -5102,6 +5089,9 @@ async def get_pending_transfers(current_user = Depends(get_current_user)):
     
     # Procesar cada transferencia para agregar información detallada del estado
     for transfer in transfers:
+        # ✅ FIX: Definir courier_name al inicio del bucle para que esté disponible en todo el contexto
+        courier_name = f"{transfer['courier_first_name'] or ''} {transfer['courier_last_name'] or ''}".strip() or "No asignado"
+        
         # Calcular tiempos transcurridos
         now = datetime.now()
         
@@ -5158,10 +5148,11 @@ async def get_pending_transfers(current_user = Depends(get_current_user)):
             }
         
         elif status == 'accepted':
+            warehouse_keeper_name = f"{transfer['warehouse_keeper_first_name'] or ''} {transfer['warehouse_keeper_last_name'] or ''}".strip() or "bodeguero"
             transfer['status_info'] = {
                 "status": "accepted",
                 "title": "✅ Aceptada - Buscando Corredor",
-                "description": f"Aceptada por {transfer['warehouse_keeper_first_name'] or 'bodeguero'}",
+                "description": f"Aceptada por {warehouse_keeper_name}",
                 "detail": "Esperando que un corredor acepte el transporte",
                 "action_required": None,
                 "next_step": "Un corredor tomará la solicitud",
@@ -5169,11 +5160,10 @@ async def get_pending_transfers(current_user = Depends(get_current_user)):
                 "urgency": "high" if transfer['purpose'] == 'cliente' else "normal",
                 "can_cancel": True,
                 "progress_percentage": 30,
-                "warehouse_keeper": f"{transfer['warehouse_keeper_first_name'] or ''} {transfer['warehouse_keeper_last_name'] or ''}".strip()
+                "warehouse_keeper": warehouse_keeper_name
             }
         
         elif status == 'courier_assigned':
-            courier_name = f"{transfer['courier_first_name'] or ''} {transfer['courier_last_name'] or ''}".strip()
             transfer['status_info'] = {
                 "status": "courier_assigned",
                 "title": "🚚 Corredor Asignado",
@@ -5193,7 +5183,6 @@ async def get_pending_transfers(current_user = Depends(get_current_user)):
             }
         
         elif status == 'in_transit':
-            courier_name = f"{transfer['courier_first_name'] or ''} {transfer['courier_last_name'] or ''}".strip()
             transfer['status_info'] = {
                 "status": "in_transit",
                 "title": "🚛 En Camino",
