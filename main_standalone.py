@@ -7743,13 +7743,18 @@ def get_user_managed_locations(user_id: int, role: str = None) -> list:
 
 @app.get("/api/v1/warehouse/pending-requests")
 async def get_pending_transfer_requests(current_user = Depends(get_current_user)):
-    """BG001: Recibir y procesar solicitudes - MEJORADO con imagen y precio"""
+    """BG001: Recibir y procesar solicitudes - CON LOGS DETALLADOS"""
+    
+    print(f"[DEBUG BODEGUERO] Iniciando pending-requests para usuario: {current_user['id']}")
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes")
     
+    # Obtener ubicaciones gestionadas
     managed_locations = get_user_managed_locations(current_user['id'], 'bodeguero')
     location_ids = [loc['location_id'] for loc in managed_locations]
+    
+    print(f"[DEBUG BODEGUERO] Ubicaciones gestionadas: {location_ids}")
     
     if not location_ids:
         return {
@@ -7766,8 +7771,10 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
         conn = psycopg2.connect(DB_PATH)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
+        print(f"[DEBUG BODEGUERO] Usando PostgreSQL")
+        
         placeholders = ','.join(['%s'] * len(location_ids))
-        cursor.execute(f'''
+        query = f'''
             SELECT tr.*, 
                    u.first_name as requester_first_name,
                    u.last_name as requester_last_name,
@@ -7789,14 +7796,62 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             ORDER BY 
                 CASE WHEN tr.purpose = 'cliente' THEN 1 ELSE 2 END,
                 sl.name, tr.requested_at ASC
-        ''', location_ids)
+        '''
+        
+        print(f"[DEBUG BODEGUERO] Query: {query}")
+        print(f"[DEBUG BODEGUERO] Parámetros: {location_ids}")
+        
+        cursor.execute(query, location_ids)
         requests = [dict(row) for row in cursor.fetchall()]
+        
+        print(f"[DEBUG BODEGUERO] Solicitudes encontradas: {len(requests)}")
+        
+        for i, request in enumerate(requests):
+            print(f"[DEBUG BODEGUERO] Solicitud {i+1}:")
+            print(f"  - ID: {request['id']}")
+            print(f"  - Reference Code: {request['sneaker_reference_code']}")
+            print(f"  - Source Location Name: {request['source_location_name']}")
+            print(f"  - Source Location ID: {request['source_location_id']}")
+            print(f"  - Product Image: {request.get('product_image')}")
+            print(f"  - Product Unit Price: {request.get('product_unit_price')}")
+            print(f"  - Product Box Price: {request.get('product_box_price')}")
+            
+            # Verificar productos existentes
+            cursor.execute('''
+                SELECT reference_code, location_name, unit_price, image_url, color_info
+                FROM products 
+                WHERE reference_code = %s
+            ''', (request['sneaker_reference_code'],))
+            all_products = [dict(row) for row in cursor.fetchall()]
+            
+            print(f"  - Total productos con reference '{request['sneaker_reference_code']}': {len(all_products)}")
+            for j, prod in enumerate(all_products):
+                print(f"    Producto {j+1}: location='{prod['location_name']}', price={prod['unit_price']}, image='{prod['image_url'][:50] if prod['image_url'] else 'None'}...'")
+            
+            # Verificar JOIN específico
+            cursor.execute('''
+                SELECT p.location_name as p_location, sl.name as sl_location,
+                       UPPER(p.location_name) as p_upper, UPPER(sl.name) as sl_upper,
+                       UPPER(p.location_name) = UPPER(sl.name) as match_check,
+                       p.unit_price, p.image_url
+                FROM products p, locations sl 
+                WHERE p.reference_code = %s AND sl.id = %s
+            ''', (request['sneaker_reference_code'], request['source_location_id']))
+            join_results = [dict(row) for row in cursor.fetchall()]
+            
+            print(f"  - JOIN debug - {len(join_results)} combinaciones:")
+            for k, join_data in enumerate(join_results):
+                print(f"    JOIN {k+1}: '{join_data['p_location']}' vs '{join_data['sl_location']}' | Match: {join_data['match_check']} | Price: {join_data['unit_price']}")
+                
     else:
+        # SQLite con logs similares
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         
+        print(f"[DEBUG BODEGUERO] Usando SQLite")
+        
         placeholders = ','.join(['?'] * len(location_ids))
-        cursor = conn.execute(f'''
+        query = f'''
             SELECT tr.*, 
                    u.first_name as requester_first_name,
                    u.last_name as requester_last_name,
@@ -7818,13 +7873,17 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             ORDER BY 
                 CASE WHEN tr.purpose = "cliente" THEN 1 ELSE 2 END,
                 sl.name, tr.requested_at ASC
-        ''', location_ids)
+        '''
+        
+        cursor = conn.execute(query, location_ids)
         requests = [dict(row) for row in cursor.fetchall()]
+        
+        print(f"[DEBUG BODEGUERO] SQLite solicitudes: {len(requests)}")
     
-    conn.close()
-    
-    # Agregar información de stock, imagen y precio
-    for request in requests:
+    # Agregar información de stock, imagen y precio con logs
+    for i, request in enumerate(requests):
+        print(f"[DEBUG BODEGUERO] Procesando solicitud {i+1}:")
+        
         availability = check_product_availability_case_insensitive(
             request['sneaker_reference_code'],
             request['size'],
@@ -7836,7 +7895,23 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
         request['available_stock'] = availability['available_stock']
         request['stock_info'] = availability
         
+        print(f"  - Stock disponible: {availability['available_stock']}")
+        print(f"  - Puede cumplir: {availability['can_fulfill']}")
+        
+        # Valores del producto antes de procesar
+        unit_price_raw = request.get('product_unit_price')
+        box_price_raw = request.get('product_box_price')
+        image_raw = request.get('product_image')
+        
+        print(f"  - Valores raw del JOIN:")
+        print(f"    unit_price: {unit_price_raw} (tipo: {type(unit_price_raw)})")
+        print(f"    box_price: {box_price_raw} (tipo: {type(box_price_raw)})")
+        print(f"    image: {image_raw}")
+        
         # Información completa del producto
+        unit_price = float(unit_price_raw) if unit_price_raw else 0.0
+        box_price = float(box_price_raw) if box_price_raw else 0.0
+        
         request['product_info'] = {
             "reference_code": request['sneaker_reference_code'],
             "brand": request['brand'],
@@ -7845,11 +7920,16 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             "quantity": request['quantity'],
             "color": request['product_color'] or "Varios",
             "description": request['product_description'] or f"{request['brand']} {request['model']}",
-            "unit_price": float(request['product_unit_price']) if request['product_unit_price'] else 0.0,
-            "box_price": float(request['product_box_price']) if request['product_box_price'] else 0.0,
-            "total_value": (float(request['product_unit_price']) if request['product_unit_price'] else 0.0) * request['quantity'],
-            "image_url": request['product_image'] or f"https://via.placeholder.com/300x200?text={request['brand'].replace(' ', '+')}+{request['model'].replace(' ', '+')}"
+            "unit_price": unit_price,
+            "box_price": box_price,
+            "total_value": unit_price * request['quantity'],
+            "image_url": image_raw or f"https://via.placeholder.com/300x200?text={request['brand'].replace(' ', '+')}+{request['model'].replace(' ', '+')}"
         }
+        
+        print(f"  - Product info procesado:")
+        print(f"    unit_price final: {request['product_info']['unit_price']}")
+        print(f"    total_value: {request['product_info']['total_value']}")
+        print(f"    image_url: {request['product_info']['image_url'][:50]}...")
         
         # Información del solicitante
         request['requester_info'] = {
@@ -7857,6 +7937,10 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
             "purpose": "Cliente presente" if request['purpose'] == 'cliente' else "Restock",
             "pickup_type": "Vendedor recogerá" if request['pickup_type'] == 'seller' else "Corredor recogerá"
         }
+    
+    conn.close()
+    
+    print(f"[DEBUG BODEGUERO] Procesamiento completado")
     
     return {
         "success": True,
