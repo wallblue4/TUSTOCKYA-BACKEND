@@ -4900,7 +4900,7 @@ async def confirm_product_reception_fetchone_fixed(
 
 @app.get("/api/v1/vendor/pending-receptions")
 async def get_pending_receptions(current_user = Depends(get_current_user)):
-    """Ver productos entregados pendientes de confirmación de recepción"""
+    """Ver productos entregados pendientes de confirmación de recepción - MEJORADO con imagen y precio"""
     
     if USE_POSTGRESQL:
         import psycopg2
@@ -4912,10 +4912,17 @@ async def get_pending_receptions(current_user = Depends(get_current_user)):
             SELECT tr.*, 
                    sl.name as source_location_name,
                    c.first_name as courier_first_name,
-                   c.last_name as courier_last_name
+                   c.last_name as courier_last_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_unit_price,
+                   p.box_price as product_box_price,
+                   p.color_info as product_color,
+                   p.description as product_description
             FROM transfer_requests tr
             JOIN locations sl ON tr.source_location_id = sl.id
             LEFT JOIN users c ON tr.courier_id = c.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
             WHERE tr.requester_id = %s AND tr.status = 'delivered'
             ORDER BY tr.delivered_at DESC
         ''', (current_user['id'],))
@@ -4928,10 +4935,17 @@ async def get_pending_receptions(current_user = Depends(get_current_user)):
             SELECT tr.*, 
                    sl.name as source_location_name,
                    c.first_name as courier_first_name,
-                   c.last_name as courier_last_name
+                   c.last_name as courier_last_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_unit_price,
+                   p.box_price as product_box_price,
+                   p.color_info as product_color,
+                   p.description as product_description
             FROM transfer_requests tr
             JOIN locations sl ON tr.source_location_id = sl.id
             LEFT JOIN users c ON tr.courier_id = c.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
             WHERE tr.requester_id = ? AND tr.status = "delivered"
             ORDER BY tr.delivered_at DESC
         ''', (current_user['id'],))
@@ -4939,19 +4953,72 @@ async def get_pending_receptions(current_user = Depends(get_current_user)):
     
     conn.close()
     
-    # Calcular tiempo desde entrega
+    # Calcular tiempo desde entrega y agregar información completa del producto
     for item in pending:
         if item['delivered_at']:
             delivered_time = datetime.fromisoformat(item['delivered_at'])
             time_since_delivery = datetime.now() - delivered_time
             item['hours_since_delivery'] = time_since_delivery.total_seconds() / 3600
             item['requires_urgent_confirmation'] = item['hours_since_delivery'] > 2  # Alerta después de 2 horas
+        else:
+            item['hours_since_delivery'] = 0
+            item['requires_urgent_confirmation'] = False
+        
+        # Información completa del producto
+        item['product_info'] = {
+            "reference_code": item['sneaker_reference_code'],
+            "brand": item['brand'],
+            "model": item['model'],
+            "size": item['size'],
+            "quantity": item['quantity'],
+            "color": item['product_color'] or "Varios",
+            "description": item['product_description'] or f"{item['brand']} {item['model']}",
+            "unit_price": float(item['product_unit_price']) if item['product_unit_price'] else 0.0,
+            "box_price": float(item['product_box_price']) if item['product_box_price'] else 0.0,
+            "total_value": (float(item['product_unit_price']) if item['product_unit_price'] else 0.0) * item['quantity'],
+            "image_url": item['product_image'] or f"https://via.placeholder.com/300x200?text={item['brand'].replace(' ', '+')}+{item['model'].replace(' ', '+')}"
+        }
+        
+        # Información de entrega
+        item['delivery_info'] = {
+            "delivered_by": "Tú mismo" if item['pickup_type'] == 'seller' else f"{item['courier_first_name']} {item['courier_last_name']}" if item['courier_first_name'] else "Corredor",
+            "delivered_from": item['source_location_name'],
+            "delivery_method": "Self-pickup" if item['pickup_type'] == 'seller' else "Courier delivery",
+            "delivered_at": item['delivered_at'],
+            "hours_ago": round(item['hours_since_delivery'], 1)
+        }
+        
+        # Estado de urgencia
+        if item['requires_urgent_confirmation']:
+            item['urgency_status'] = {
+                "level": "high",
+                "message": f"Pendiente por {round(item['hours_since_delivery'], 1)} horas - Confirma pronto",
+                "color": "red"
+            }
+        elif item['hours_since_delivery'] > 1:
+            item['urgency_status'] = {
+                "level": "medium", 
+                "message": f"Pendiente por {round(item['hours_since_delivery'], 1)} horas",
+                "color": "orange"
+            }
+        else:
+            item['urgency_status'] = {
+                "level": "normal",
+                "message": "Recién entregado",
+                "color": "green"
+            }
     
     return {
         "success": True,
         "pending_receptions": pending,
         "count": len(pending),
-        "urgent_count": len([p for p in pending if p.get('requires_urgent_confirmation', False)])
+        "urgent_count": len([p for p in pending if p.get('requires_urgent_confirmation', False)]),
+        "total_value": sum(p['product_info']['total_value'] for p in pending),
+        "summary": {
+            "self_pickup": len([p for p in pending if p['pickup_type'] == 'seller']),
+            "courier_delivery": len([p for p in pending if p['pickup_type'] == 'corredor']),
+            "average_hours_pending": round(sum(p['hours_since_delivery'] for p in pending) / len(pending), 1) if pending else 0
+        }
     }
 
 def process_pickup_confirmation(request_id: int, user_id: int, actor_type: str, notes: str = ""):
@@ -5163,12 +5230,12 @@ def process_delivery_confirmation(request_id: int, user_id: int, actor_type: str
 
 @app.get("/api/v1/vendor/pending-transfers")
 async def get_pending_transfers_with_pickup_context(current_user = Depends(get_current_user)):
-    """VE003: Ver transferencias pendientes - MEJORADO con contexto de pickup"""
+    """VE003: Ver transferencias pendientes - MODIFICADO para flujo simplificado"""
     
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden ver sus transferencias pendientes")
     
-    # Query existente sin cambios (ya incluye pickup_type)
+    # Query existente sin cambios
     if USE_POSTGRESQL:
         import psycopg2
         import psycopg2.extras
@@ -5253,7 +5320,7 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
     
     conn.close()
     
-    # Procesamiento con contexto de pickup
+    # CAMBIO: Nueva lógica de procesamiento según pickup_type
     for transfer in transfers:
         # Obtener info del ejecutor
         executor_info = get_transfer_executor_info(transfer)
@@ -5269,7 +5336,7 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
             except:
                 transfer['hours_since_request'] = 0
         
-        # Estado detallado CON CONTEXTO DE PICKUP
+        # CAMBIO: Estado detallado CON FLUJO SIMPLIFICADO
         status = transfer['status']
         is_self_pickup = transfer['is_self_pickup']
         
@@ -5289,15 +5356,14 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
             warehouse_keeper = f"{transfer['warehouse_keeper_first_name'] or ''} {transfer['warehouse_keeper_last_name'] or ''}".strip()
             
             if is_self_pickup:
-                # Nunca debería llegar aquí porque auto-asignamos, pero por seguridad
                 transfer['status_info'] = {
                     "status": "accepted",
-                    "title": "Preparando para tu Pickup",
-                    "description": f"Aceptada por {warehouse_keeper}",
-                    "detail": "Preparando producto para que vayas a recoger",
+                    "title": "Listo para Recoger",
+                    "description": f"Aceptada por {warehouse_keeper} - Ve a recoger",
+                    "detail": "El bodeguero te entregará el producto cuando llegues",
                     "action_required": None,
-                    "next_step": "Esperando que esté listo para recoger",
-                    "progress_percentage": 30
+                    "next_step": "Ve a la bodega cuando puedas",
+                    "progress_percentage": 50
                 }
             else:
                 transfer['status_info'] = {
@@ -5310,57 +5376,39 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
                     "progress_percentage": 30
                 }
         
+        # ELIMINADO: caso 'courier_assigned' para self_pickup (ya no existe)
+        
         elif status == 'courier_assigned':
-            if is_self_pickup:
-                transfer['status_info'] = {
-                    "status": "courier_assigned",
-                    "title": "Listo para Recoger",
-                    "description": f"Ve a {transfer['source_location_name']} a recoger",
-                    "detail": "Producto preparado, puedes ir a recogerlo",
-                    "action_required": "ir_a_recoger_personal",
-                    "next_step": "Ve a la bodega y confirma el pickup",
-                    "progress_percentage": 50,
-                    "action_endpoint": f"/api/v1/vendor/confirm-pickup/{transfer['id']}"
-                }
-            else:
-                transfer['status_info'] = {
-                    "status": "courier_assigned",
-                    "title": "Corredor Asignado",
-                    "description": f"Corredor {transfer['executor_name']} va a recoger",
-                    "detail": f"El corredor se dirige a {transfer['source_location_name']}",
-                    "action_required": None,
-                    "next_step": "Corredor recogerá el producto",
-                    "progress_percentage": 50
-                }
+            # Solo para corredor
+            transfer['status_info'] = {
+                "status": "courier_assigned",
+                "title": "Corredor Asignado",
+                "description": f"Corredor {transfer['executor_name']} va a recoger",
+                "detail": f"El corredor se dirige a {transfer['source_location_name']}",
+                "action_required": None,
+                "next_step": "Corredor recogerá el producto",
+                "progress_percentage": 50
+            }
+        
+        # ELIMINADO: caso 'in_transit' para self_pickup (ya no existe)
         
         elif status == 'in_transit':
-            if is_self_pickup:
-                transfer['status_info'] = {
-                    "status": "in_transit",
-                    "title": "Regresando con Producto",
-                    "description": "Recogiste el producto, confirma tu llegada",
-                    "detail": "Confirma cuando llegues a tu local con el producto",
-                    "action_required": "confirmar_llegada_personal",
-                    "next_step": "Confirmar llegada a tu local",
-                    "progress_percentage": 75,
-                    "action_endpoint": f"/api/v1/vendor/confirm-arrival/{transfer['id']}"
-                }
-            else:
-                transfer['status_info'] = {
-                    "status": "in_transit",
-                    "title": "En Camino",
-                    "description": f"Corredor {transfer['executor_name']} viene hacia ti",
-                    "detail": "Producto recogido, en tránsito a tu local",
-                    "action_required": None,
-                    "next_step": "Esperar llegada del corredor",
-                    "progress_percentage": 75
-                }
+            # Solo para corredor
+            transfer['status_info'] = {
+                "status": "in_transit",
+                "title": "En Camino",
+                "description": f"Corredor {transfer['executor_name']} viene hacia ti",
+                "detail": "Producto recogido, en tránsito a tu local",
+                "action_required": None,
+                "next_step": "Esperar llegada del corredor",
+                "progress_percentage": 75
+            }
         
         elif status == 'delivered':
             transfer['status_info'] = {
                 "status": "delivered",
                 "title": "Producto Contigo - Confirma Recepción",
-                "description": f"{'Llegaste' if is_self_pickup else 'Entregado'} - confirma recepción",
+                "description": f"{'Recibiste' if is_self_pickup else 'Entregado'} - confirma recepción",
                 "detail": "Confirma que el producto está en buen estado",
                 "action_required": "confirm_reception",
                 "next_step": "Confirmar recepción para actualizar inventario",
@@ -7695,12 +7743,11 @@ def get_user_managed_locations(user_id: int, role: str = None) -> list:
 
 @app.get("/api/v1/warehouse/pending-requests")
 async def get_pending_transfer_requests(current_user = Depends(get_current_user)):
-    """BG001: Recibir y procesar solicitudes de productos - VERSIÓN MÚLTIPLES UBICACIONES"""
+    """BG001: Recibir y procesar solicitudes - MEJORADO con imagen y precio"""
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes")
     
-    # ✅ Obtener ubicaciones asignadas al bodeguero
     managed_locations = get_user_managed_locations(current_user['id'], 'bodeguero')
     location_ids = [loc['location_id'] for loc in managed_locations]
     
@@ -7719,7 +7766,6 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
         conn = psycopg2.connect(DB_PATH)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # ✅ Usar IN para múltiples ubicaciones
         placeholders = ','.join(['%s'] * len(location_ids))
         cursor.execute(f'''
             SELECT tr.*, 
@@ -7728,8 +7774,10 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
                    sl.name as source_location_name,
                    dl.name as destination_location_name,
                    p.image_url as product_image,
-                   p.unit_price as product_price,
-                   p.color_info as product_color
+                   p.unit_price as product_unit_price,
+                   p.box_price as product_box_price,
+                   p.color_info as product_color,
+                   p.description as product_description
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
@@ -7755,14 +7803,16 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
                    sl.name as source_location_name,
                    dl.name as destination_location_name,
                    p.image_url as product_image,
-                   p.unit_price as product_price,
-                   p.color_info as product_color
+                   p.unit_price as product_unit_price,
+                   p.box_price as product_box_price,
+                   p.color_info as product_color,
+                   p.description as product_description
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
-                                   AND p.location_name = sl.name)
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
             WHERE tr.status = "pending" 
             AND sl.id IN ({placeholders})
             ORDER BY 
@@ -7773,7 +7823,7 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
     
     conn.close()
     
-    # Agregar información de stock y imagen fallback
+    # Agregar información de stock, imagen y precio
     for request in requests:
         availability = check_product_availability_case_insensitive(
             request['sneaker_reference_code'],
@@ -7786,9 +7836,27 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
         request['available_stock'] = availability['available_stock']
         request['stock_info'] = availability
         
-        # Imagen fallback si no hay imagen del producto
-        if not request['product_image']:
-            request['product_image'] = f"https://via.placeholder.com/300x200?text={request['brand']}+{request['model']}"
+        # Información completa del producto
+        request['product_info'] = {
+            "reference_code": request['sneaker_reference_code'],
+            "brand": request['brand'],
+            "model": request['model'],
+            "size": request['size'],
+            "quantity": request['quantity'],
+            "color": request['product_color'] or "Varios",
+            "description": request['product_description'] or f"{request['brand']} {request['model']}",
+            "unit_price": float(request['product_unit_price']) if request['product_unit_price'] else 0.0,
+            "box_price": float(request['product_box_price']) if request['product_box_price'] else 0.0,
+            "total_value": (float(request['product_unit_price']) if request['product_unit_price'] else 0.0) * request['quantity'],
+            "image_url": request['product_image'] or f"https://via.placeholder.com/300x200?text={request['brand'].replace(' ', '+')}+{request['model'].replace(' ', '+')}"
+        }
+        
+        # Información del solicitante
+        request['requester_info'] = {
+            "name": f"{request['requester_first_name']} {request['requester_last_name']}",
+            "purpose": "Cliente presente" if request['purpose'] == 'cliente' else "Restock",
+            "pickup_type": "Vendedor recogerá" if request['pickup_type'] == 'seller' else "Corredor recogerá"
+        }
     
     return {
         "success": True,
@@ -7805,7 +7873,7 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
 
 @app.get("/api/v1/warehouse/accepted-requests")
 async def get_accepted_transfer_requests(current_user = Depends(get_current_user)):
-    """BG002: Ver solicitudes aceptadas y en preparación - VERSIÓN MÚLTIPLES UBICACIONES"""
+    """BG002: Ver solicitudes aceptadas y en preparación - MODIFICADO para flujo simplificado"""
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes aceptadas")
@@ -7884,9 +7952,15 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
     
     conn.close()
     
-    # Agregar información de estado y imagen fallback
+    # CAMBIO: Nueva lógica de estado según pickup_type
     for request in requests:
-        if request['status'] == 'accepted':
+        if request['pickup_type'] == 'seller' and request['status'] == 'accepted':
+            request['status_description'] = 'Listo para entregar al vendedor'
+            request['action_available'] = True
+            request['ready_for_pickup'] = True
+            request['action_type'] = 'deliver_to_vendor'
+            request['action_endpoint'] = f"/api/v1/warehouse/deliver-to-vendor/{request['id']}"
+        elif request['pickup_type'] == 'corredor' and request['status'] == 'accepted':
             request['status_description'] = 'Esperando corredor'
             request['action_available'] = False
             request['ready_for_pickup'] = False
@@ -7908,7 +7982,8 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
         "accepted_requests": requests,
         "count": len(requests),
         "breakdown": {
-            "waiting_courier": len([r for r in requests if r['status'] == 'accepted']),
+            "waiting_courier": len([r for r in requests if r['status'] == 'accepted' and r['pickup_type'] == 'corredor']),
+            "ready_for_vendor": len([r for r in requests if r['status'] == 'accepted' and r['pickup_type'] == 'seller']),
             "courier_assigned": len([r for r in requests if r['status'] == 'courier_assigned']),
             "in_transit": len([r for r in requests if r['status'] == 'in_transit'])
         },
@@ -8003,18 +8078,18 @@ async def get_vendor_pickup_assignments(current_user = Depends(get_current_user)
         }
     }
 
-@app.post("/api/v1/vendor/confirm-pickup/{request_id}")
-async def vendor_confirm_pickup(
-    request_id: int,
+@app.post("/api/v1/warehouse/deliver-to-vendor/{transfer_id}")
+async def deliver_to_vendor(
+    transfer_id: int,
+    delivered: bool = True,
     notes: str = "",
     current_user = Depends(get_current_user)
 ):
-    """VE010: Vendedor confirma que recogió producto de la bodega"""
+    """Entregar producto directamente al vendedor (self-pickup)"""
     
-    if current_user['role'] not in ['seller', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo vendedores pueden confirmar pickup")
+    if current_user['role'] not in ['bodeguero', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo bodegueros pueden entregar productos")
     
-    # Validación específica: debe ser vendedor Y su propia transferencia
     if USE_POSTGRESQL:
         import psycopg2
         import psycopg2.extras
@@ -8022,87 +8097,114 @@ async def vendor_confirm_pickup(
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         cursor.execute('''
-            SELECT pickup_type, requester_id FROM transfer_requests 
-            WHERE id = %s AND courier_id = %s
-        ''', (request_id, current_user['id']))
+            SELECT * FROM transfer_requests 
+            WHERE id = %s AND status = 'accepted' 
+            AND pickup_type = 'seller'
+            AND warehouse_keeper_id = %s
+        ''', (transfer_id, current_user['id']))
+        request = cursor.fetchone()
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         
         cursor = conn.execute('''
-            SELECT pickup_type, requester_id FROM transfer_requests 
-            WHERE id = ? AND courier_id = ?
-        ''', (request_id, current_user['id']))
+            SELECT * FROM transfer_requests 
+            WHERE id = ? AND status = "accepted" 
+            AND pickup_type = "seller"
+            AND warehouse_keeper_id = ?
+        ''', (transfer_id, current_user['id']))
+        request = cursor.fetchone()
     
-    transfer_info = cursor.fetchone()
-    conn.close()
+    if not request:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada o no autorizada")
     
-    if not transfer_info:
-        raise HTTPException(status_code=404, detail="Transferencia no encontrada o no asignada")
+    timestamp = datetime.now().isoformat()
     
-    # Verificación adicional: debe ser pickup por vendedor Y ser su propia solicitud
-    if transfer_info['pickup_type'] != 'seller':
-        raise HTTPException(status_code=400, detail="Esta transferencia no es para pickup por vendedor")
-    
-    if transfer_info['requester_id'] != current_user['id']:
-        raise HTTPException(status_code=403, detail="Solo puedes confirmar pickup de tus propias transferencias")
-    
-    # Llamar función común
-    return process_pickup_confirmation(request_id, current_user['id'], 'vendor', notes)
-
-@app.post("/api/v1/vendor/confirm-arrival/{request_id}")
-async def vendor_confirm_arrival(
-    request_id: int,
-    delivery_successful: bool = True,
-    notes: str = "",
-    current_user = Depends(get_current_user)
-):
-    """VE011: Vendedor confirma que llegó a su local con el producto"""
-    
-    if current_user['role'] not in ['seller', 'administrador']:
-        raise HTTPException(status_code=403, detail="Solo vendedores pueden confirmar llegada")
-    
-    # Validaciones similares al endpoint anterior
-    if USE_POSTGRESQL:
-        import psycopg2
-        import psycopg2.extras
-        conn = psycopg2.connect(DB_PATH)
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        if delivered:
+            # Descontar inventario automáticamente
+            if USE_POSTGRESQL:
+                cursor.execute('''
+                    UPDATE product_sizes 
+                    SET quantity = quantity - %s
+                    WHERE product_id = (
+                        SELECT p.id FROM products p 
+                        WHERE p.reference_code = %s 
+                        AND UPPER(p.location_name) = UPPER((SELECT name FROM locations WHERE id = %s))
+                    ) 
+                    AND size = %s
+                ''', (request['quantity'], request['sneaker_reference_code'], 
+                      request['source_location_id'], request['size']))
+                
+                cursor.execute('''
+                    UPDATE transfer_requests 
+                    SET status = 'delivered', delivered_at = %s, notes = %s
+                    WHERE id = %s
+                ''', (timestamp, notes, transfer_id))
+            else:
+                conn.execute('''
+                    UPDATE product_sizes 
+                    SET quantity = quantity - ?
+                    WHERE product_id = (
+                        SELECT p.id FROM products p 
+                        WHERE p.reference_code = ? 
+                        AND UPPER(p.location_name) = UPPER((SELECT name FROM locations WHERE id = ?))
+                    ) 
+                    AND size = ?
+                ''', (request['quantity'], request['sneaker_reference_code'], 
+                      request['source_location_id'], request['size']))
+                
+                conn.execute('''
+                    UPDATE transfer_requests 
+                    SET status = "delivered", delivered_at = ?, notes = ?
+                    WHERE id = ?
+                ''', (timestamp, notes, transfer_id))
+            
+            conn.commit()
+            message = "Producto entregado al vendedor exitosamente"
+            
+        else:
+            # Marcar como problema de entrega
+            if USE_POSTGRESQL:
+                cursor.execute('''
+                    UPDATE transfer_requests 
+                    SET status = 'delivery_failed', notes = %s
+                    WHERE id = %s
+                ''', (f"Problema en entrega: {notes}", transfer_id))
+            else:
+                conn.execute('''
+                    UPDATE transfer_requests 
+                    SET status = "delivery_failed", notes = ?
+                    WHERE id = ?
+                ''', (f"Problema en entrega: {notes}", transfer_id))
+            
+            conn.commit()
+            message = "Entrega marcada con problemas"
         
-        cursor.execute('''
-            SELECT pickup_type, requester_id FROM transfer_requests 
-            WHERE id = %s AND courier_id = %s
-        ''', (request_id, current_user['id']))
-    else:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        return {
+            "success": True,
+            "message": message,
+            "transfer_id": transfer_id,
+            "status": "delivered" if delivered else "delivery_failed",
+            "delivered_at": timestamp,
+            "inventory_updated": delivered,
+            "next_step": "Vendedor debe confirmar recepción" if delivered else "Revisar problemas reportados",
+            "delivered_by": f"{current_user['first_name']} {current_user['last_name']}"
+        }
         
-        cursor = conn.execute('''
-            SELECT pickup_type, requester_id FROM transfer_requests 
-            WHERE id = ? AND courier_id = ?
-        ''', (request_id, current_user['id']))
-    
-    transfer_info = cursor.fetchone()
-    conn.close()
-    
-    if not transfer_info:
-        raise HTTPException(status_code=404, detail="Transferencia no encontrada")
-    
-    if transfer_info['pickup_type'] != 'seller':
-        raise HTTPException(status_code=400, detail="Esta transferencia no es para pickup por vendedor")
-    
-    if transfer_info['requester_id'] != current_user['id']:
-        raise HTTPException(status_code=403, detail="Solo puedes confirmar llegada de tus propias transferencias")
-    
-    # Llamar función común
-    return process_delivery_confirmation(request_id, current_user['id'], 'vendor', delivery_successful, notes)
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Error procesando entrega: {str(e)}")
+    finally:
+        conn.close()
 
 @app.post("/api/v1/warehouse/accept-request")
 async def accept_transfer_request_with_auto_assignment(
     acceptance: TransferAcceptance,
     current_user = Depends(get_current_user)
 ):
-    """BG002: Aceptar solicitud con auto-asignación para vendedores"""
+    """BG002: Aceptar solicitud con flujo simplificado para vendedores"""
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden aceptar solicitudes")
@@ -8158,19 +8260,18 @@ async def accept_transfer_request_with_auto_assignment(
                 detail=f"Stock insuficiente. Disponible: {availability['available_stock']}"
             )
         
-        # NUEVA LÓGICA: Determinar estado y asignación según pickup_type
         timestamp = datetime.now().isoformat()
         
+        # CAMBIO: Mismo estado para ambos tipos
+        new_status = "accepted"
+        
+        # Solo para tracking interno
         if request['pickup_type'] == 'seller':
-            # AUTO-ASIGNAR al vendedor solicitante
-            new_status = "courier_assigned"
-            assigned_courier_id = request['requester_id']  # El vendedor es su propio "corredor"
-            print(f"Auto-asignando transferencia al vendedor solicitante ID: {assigned_courier_id}")
+            assigned_courier_id = request['requester_id']
+            success_message = "Solicitud aceptada - Vendedor puede venir a recoger"
         else:
-            # Flujo normal para corredor
-            new_status = "accepted"
             assigned_courier_id = None
-            print(f"Transferencia lista para asignación de corredor")
+            success_message = "Solicitud aceptada - Esperando corredor"
         
         # Actualizar en BD
         if USE_POSTGRESQL:
@@ -8189,8 +8290,6 @@ async def accept_transfer_request_with_auto_assignment(
                 WHERE id = ?
             ''', (new_status, current_user['id'], assigned_courier_id, 
                   timestamp, acceptance.notes, acceptance.transfer_request_id))
-        
-        success_message = f"Solicitud aceptada - {'Auto-asignada al vendedor' if request['pickup_type'] == 'seller' else 'Esperando corredor'}"
         
     else:
         # Rechazar
@@ -8219,7 +8318,7 @@ async def accept_transfer_request_with_auto_assignment(
         "transfer_request_id": acceptance.transfer_request_id,
         "status": new_status if acceptance.accepted else "cancelled",
         "pickup_type": request['pickup_type'],
-        "auto_assigned": request['pickup_type'] == 'seller' and acceptance.accepted,
+        "next_step": "Preparar producto para entrega" if request['pickup_type'] == 'seller' and acceptance.accepted else "Esperar corredor" if acceptance.accepted else "Solicitud cancelada",
         "processed_by": f"{current_user['first_name']} {current_user['last_name']}"
     }
 
@@ -8440,7 +8539,7 @@ def get_transfer_executor_info(transfer):
 
 @app.get("/api/v1/courier/available-requests")
 async def get_available_courier_requests_filtered(current_user = Depends(get_current_user)):
-    """CO001: Recibir notificaciones de solicitudes - MODIFICADO para filtrar por pickup_type"""
+    """CO001: Recibir notificaciones de solicitudes - MEJORADO con imagen y precio"""
     
     if current_user['role'] not in ['corredor', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo corredores pueden ver solicitudes")
@@ -8462,20 +8561,25 @@ async def get_available_courier_requests_filtered(current_user = Depends(get_cur
                    wk.first_name as warehouse_keeper_first_name,
                    wk.last_name as warehouse_keeper_last_name,
                    c.first_name as courier_first_name,
-                   c.last_name as courier_last_name
+                   c.last_name as courier_last_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_unit_price,
+                   p.box_price as product_box_price,
+                   p.color_info as product_color,
+                   p.description as product_description
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
             LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
             LEFT JOIN users c ON tr.courier_id = c.id
-            WHERE (
-                -- NUEVO FILTRO: Solo transferencias para corredor disponibles
-                (tr.status = 'accepted' AND tr.courier_id IS NULL AND tr.pickup_type = 'corredor')
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
+            WHERE tr.pickup_type = 'corredor'
+            AND (
+                (tr.status = 'accepted' AND tr.courier_id IS NULL)
                 OR
-                -- Transferencias ya asignadas al corredor actual (solo tipo corredor)
-                (tr.courier_id = %s AND tr.status IN ('courier_assigned', 'in_transit') 
-                 AND tr.pickup_type = 'corredor')
+                (tr.courier_id = %s AND tr.status IN ('courier_assigned', 'in_transit'))
             )
             ORDER BY 
                 CASE WHEN tr.purpose = 'cliente' THEN 1 ELSE 2 END,
@@ -8497,19 +8601,25 @@ async def get_available_courier_requests_filtered(current_user = Depends(get_cur
                    wk.first_name as warehouse_keeper_first_name,
                    wk.last_name as warehouse_keeper_last_name,
                    c.first_name as courier_first_name,
-                   c.last_name as courier_last_name
+                   c.last_name as courier_last_name,
+                   p.image_url as product_image,
+                   p.unit_price as product_unit_price,
+                   p.box_price as product_box_price,
+                   p.color_info as product_color,
+                   p.description as product_description
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
             LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
             LEFT JOIN users c ON tr.courier_id = c.id
-            WHERE (
-                -- NUEVO FILTRO para SQLite
-                (tr.status = "accepted" AND tr.courier_id IS NULL AND tr.pickup_type = "corredor")
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
+            WHERE tr.pickup_type = "corredor"
+            AND (
+                (tr.status = "accepted" AND tr.courier_id IS NULL)
                 OR
-                (tr.courier_id = ? AND tr.status IN ("courier_assigned", "in_transit") 
-                 AND tr.pickup_type = "corredor")
+                (tr.courier_id = ? AND tr.status IN ("courier_assigned", "in_transit"))
             )
             ORDER BY 
                 CASE WHEN tr.purpose = "cliente" THEN 1 ELSE 2 END,
@@ -8519,7 +8629,7 @@ async def get_available_courier_requests_filtered(current_user = Depends(get_cur
     
     conn.close()
     
-    # Procesamiento existente sin cambios
+    # Procesamiento con información completa del producto
     for request in requests:
         if request['accepted_at']:
             try:
@@ -8544,6 +8654,21 @@ async def get_available_courier_requests_filtered(current_user = Depends(get_cur
             request['action_required'] = "deliver"
             request['status_description'] = "En tránsito - entregar al destino"
             request['next_step'] = "Entregar producto en destino"
+        
+        # Información completa del producto
+        request['product_info'] = {
+            "reference_code": request['sneaker_reference_code'],
+            "brand": request['brand'],
+            "model": request['model'],
+            "size": request['size'],
+            "quantity": request['quantity'],
+            "color": request['product_color'] or "Varios",
+            "description": request['product_description'] or f"{request['brand']} {request['model']}",
+            "unit_price": float(request['product_unit_price']) if request['product_unit_price'] else 0.0,
+            "box_price": float(request['product_box_price']) if request['product_box_price'] else 0.0,
+            "total_value": (float(request['product_unit_price']) if request['product_unit_price'] else 0.0) * request['quantity'],
+            "image_url": request['product_image'] or f"https://via.placeholder.com/300x200?text={request['brand'].replace(' ', '+')}+{request['model'].replace(' ', '+')}"
+        }
         
         request['request_info'] = {
             "pickup_location": request['source_location_name'],
@@ -8570,9 +8695,8 @@ async def get_available_courier_requests_filtered(current_user = Depends(get_cur
             "name": f"{current_user['first_name']} {current_user['last_name']}",
             "courier_id": current_user['id']
         },
-        "filter_applied": "Solo transferencias para corredor"
+        "filter_applied": "Solo transferencias para corredor - Vendedores completamente excluidos"
     }
-
 # ==================== ENDPOINT CORREGIDO PARA ACEPTAR TRANSPORTE ====================
 
 @app.post("/api/v1/courier/accept-request/{request_id}")
