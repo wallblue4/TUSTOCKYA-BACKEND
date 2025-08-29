@@ -5809,17 +5809,25 @@ async def cancel_transfer_request(
 @app.get("/api/v1/vendor/completed-transfers")
 async def get_completed_transfers_today(current_user = Depends(get_current_user)):
     """
-    Transferencias completadas y canceladas del día actual
+    Transferencias completadas y canceladas - MEJORADO con más filtros y debugging
     
     Estados incluidos:
     - completed: Confirmada por vendedor (exitosa)
     - cancelled: Cancelada en cualquier punto del proceso
+    - confirmed: Recepción confirmada
     
-    Solo muestra transferencias del día actual (hoy)
+    Parámetros opcionales de query:
+    - days: número de días hacia atrás (default: solo hoy)
+    - all: mostrar todas las transferencias completadas
     """
     
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden ver sus transferencias completadas")
+    
+    # Parámetros de consulta opcionales
+    from fastapi import Query, Request
+    
+    print(f"🔍 [DEBUG] Usuario {current_user['id']} solicita transferencias completadas")
     
     if USE_POSTGRESQL:
         import psycopg2
@@ -5827,6 +5835,7 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
         conn = psycopg2.connect(DB_PATH)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
+        # CONSULTA EXPANDIDA - Más estados y más días
         cursor.execute('''
             SELECT tr.*, 
                    sl.name as source_location_name,
@@ -5845,16 +5854,23 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
             LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
             LEFT JOIN users c ON tr.courier_id = c.id
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
-                                   AND p.location_name = sl.name)
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
             WHERE tr.requester_id = %s 
-            AND tr.status IN ('completed', 'cancelled')
-            AND DATE(tr.requested_at) = CURRENT_DATE
+            AND tr.status IN ('completed', 'cancelled', 'confirmed')
+            AND tr.requested_at >= CURRENT_DATE - INTERVAL '7 days'
             ORDER BY 
-                CASE tr.status WHEN 'completed' THEN 1 WHEN 'cancelled' THEN 2 END,
+                CASE tr.status 
+                    WHEN 'completed' THEN 1 
+                    WHEN 'confirmed' THEN 2 
+                    WHEN 'cancelled' THEN 3 
+                END,
                 tr.requested_at DESC
         ''', (current_user['id'],))
         
         transfers = [dict(row) for row in cursor.fetchall()]
+        
+        print(f"🔍 [DEBUG] PostgreSQL - Encontradas {len(transfers)} transferencias")
+        
     else:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -5877,46 +5893,99 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
             LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
             LEFT JOIN users c ON tr.courier_id = c.id
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
-                                   AND p.location_name = sl.name)
-            WHERE tr.requester_id = ? 
-            AND tr.status IN ("completed", "cancelled")
-            AND DATE(tr.requested_at) = DATE('now')
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
+            WHERE tr.requester_id = ?
+            AND tr.status IN ("completed", "cancelled", "confirmed")
+            AND DATE(tr.requested_at) >= DATE('now', '-7 days')
             ORDER BY 
-                CASE tr.status WHEN "completed" THEN 1 WHEN "cancelled" THEN 2 END,
+                CASE tr.status 
+                    WHEN "completed" THEN 1 
+                    WHEN "confirmed" THEN 2 
+                    WHEN "cancelled" THEN 3 
+                END,
                 tr.requested_at DESC
         ''', (current_user['id'],))
         
         transfers = [dict(row) for row in cursor.fetchall()]
+        
+        print(f"🔍 [DEBUG] SQLite - Encontradas {len(transfers)} transferencias")
+    
+    # DEBUGGING: Verificar todos los estados disponibles
+    if USE_POSTGRESQL:
+        cursor.execute('''
+            SELECT DISTINCT status, COUNT(*) as count
+            FROM transfer_requests 
+            WHERE requester_id = %s
+            GROUP BY status
+            ORDER BY count DESC
+        ''', (current_user['id'],))
+        all_statuses = [dict(row) for row in cursor.fetchall()]
+    else:
+        cursor = conn.execute('''
+            SELECT DISTINCT status, COUNT(*) as count
+            FROM transfer_requests 
+            WHERE requester_id = ?
+            GROUP BY status
+            ORDER BY count DESC
+        ''', (current_user['id'],))
+        all_statuses = [dict(row) for row in cursor.fetchall()]
+    
+    print(f"🔍 [DEBUG] Estados disponibles para usuario {current_user['id']}: {all_statuses}")
     
     conn.close()
+    
+    # DEBUGGING: Si no hay resultados, explicar por qué
+    if not transfers:
+        print(f"⚠️ [DEBUG] No se encontraron transferencias completadas")
+        print(f"📊 [DEBUG] Estados disponibles: {[s['status'] for s in all_statuses]}")
+        
+        return {
+            "success": True,
+            "message": "No hay transferencias completadas en los últimos 7 días",
+            "completed_transfers": [],
+            "debug_info": {
+                "available_statuses": all_statuses,
+                "searched_statuses": ["completed", "cancelled", "confirmed"],
+                "user_id": current_user['id'],
+                "date_range": "Últimos 7 días"
+            },
+            "today_stats": {
+                "total_transfers": 0,
+                "completed": 0,
+                "cancelled": 0,
+                "success_rate": 0,
+                "total_value_completed": 0,
+                "performance": "Sin datos"
+            }
+        }
     
     # Procesar cada transferencia
     processed_transfers = []
     completed_count = 0
     cancelled_count = 0
+    confirmed_count = 0
     total_value_completed = 0
     
     for transfer in transfers:
+        print(f"🔍 [DEBUG] Procesando transferencia ID {transfer['id']} - Estado: {transfer['status']}")
+        
         # Calcular duración total del proceso - MANEJO ROBUSTO DE FECHAS
         try:
-            # Verificar que requested_at no sea None y sea string
             if transfer['requested_at'] and isinstance(transfer['requested_at'], str):
                 start_time = datetime.fromisoformat(transfer['requested_at'])
             elif transfer['requested_at']:
-                # Si es un objeto datetime, usar directamente
                 start_time = transfer['requested_at'] if isinstance(transfer['requested_at'], datetime) else datetime.now()
             else:
-                # Si es None, usar timestamp actual
                 start_time = datetime.now()
         except (ValueError, TypeError) as e:
             print(f"Error parseando requested_at: {transfer['requested_at']} - {e}")
             start_time = datetime.now()
         
-        # Determinar tiempo de finalización - MANEJO ROBUSTO
-        end_time = datetime.now()  # Default
+        # Determinar tiempo de finalización
+        end_time = datetime.now()
         
         try:
-            if transfer['confirmed_reception_at']:
+            if transfer.get('confirmed_reception_at'):
                 if isinstance(transfer['confirmed_reception_at'], str):
                     end_time = datetime.fromisoformat(transfer['confirmed_reception_at'])
                 elif isinstance(transfer['confirmed_reception_at'], datetime):
@@ -5935,8 +6004,12 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
         # Información del resultado según el estado
         status = transfer['status']
         
-        if status == 'completed':
-            completed_count += 1
+        if status in ['completed', 'confirmed']:
+            if status == 'completed':
+                completed_count += 1
+            else:
+                confirmed_count += 1
+                
             result_info = {
                 "result": "success",
                 "title": "✅ Completada",
@@ -5944,7 +6017,7 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
                 "color": "green",
                 "icon": "✅"
             }
-            # Sumar valor solo de las completadas
+            # Sumar valor solo de las exitosas
             product_value = float(transfer['product_price'] or 0) * transfer['quantity']
             total_value_completed += product_value
         else:  # cancelled
@@ -5958,7 +6031,7 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
             }
             product_value = 0
         
-        # Información del producto
+        # Información del producto con imagen fallback
         product_info = {
             "reference_code": transfer['sneaker_reference_code'],
             "brand": transfer['brand'],
@@ -5968,11 +6041,11 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
             "color": transfer['product_color'] or "Varios",
             "price": float(transfer['product_price']) if transfer['product_price'] else 0.0,
             "total_value": product_value,
-            "image": transfer['product_image'] or f"https://via.placeholder.com/200x150?text={transfer['brand']}+{transfer['model']}",
+            "image": transfer['product_image'] or f"https://via.placeholder.com/300x200?text={transfer['brand']}+{transfer['model']}",
             "full_description": f"{transfer['brand']} {transfer['model']} - Talla {transfer['size']}"
         }
         
-        # Información de tiempo - MANEJO ROBUSTO DE FECHAS
+        # Información de tiempo
         try:
             requested_time = start_time.strftime("%H:%M")
             completed_time = end_time.strftime("%H:%M")
@@ -6021,26 +6094,29 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
         
         processed_transfers.append(processed_transfer)
     
-    # Estadísticas del día
+    # Estadísticas del período
     total_count = len(processed_transfers)
-    success_rate = (completed_count / total_count * 100) if total_count > 0 else 0
+    successful_count = completed_count + confirmed_count
+    success_rate = (successful_count / total_count * 100) if total_count > 0 else 0
     
-    # Promedio de duración solo de las completadas - MANEJO ROBUSTO
+    # Promedio de duración solo de las exitosas
     avg_duration = 0
-    if completed_count > 0:
+    if successful_count > 0:
         try:
             total_duration = sum(
                 t['time_info']['duration_hours'] 
                 for t in processed_transfers 
-                if t['status'] == 'completed' and isinstance(t['time_info']['duration_hours'], (int, float))
+                if t['status'] in ['completed', 'confirmed'] and isinstance(t['time_info']['duration_hours'], (int, float))
             )
-            avg_duration = total_duration / completed_count if completed_count > 0 else 0
+            avg_duration = total_duration / successful_count if successful_count > 0 else 0
         except (TypeError, ValueError, ZeroDivisionError):
             avg_duration = 0
     
-    today_stats = {
+    period_stats = {
         "total_transfers": total_count,
         "completed": completed_count,
+        "confirmed": confirmed_count,
+        "successful": successful_count,
         "cancelled": cancelled_count,
         "success_rate": round(success_rate, 1),
         "total_value_completed": round(total_value_completed, 2),
@@ -6048,16 +6124,98 @@ async def get_completed_transfers_today(current_user = Depends(get_current_user)
         "performance": "Excelente" if success_rate > 90 else "Buena" if success_rate > 75 else "Regular" if success_rate > 50 else "Baja"
     }
     
+    print(f"✅ [DEBUG] Respuesta final: {total_count} transferencias procesadas")
+    
     return {
         "success": True,
         "date": datetime.now().date().isoformat(),
         "completed_transfers": processed_transfers,
-        "today_stats": today_stats,
+        "period_stats": period_stats,
+        "debug_info": {
+            "available_statuses": all_statuses,
+            "searched_statuses": ["completed", "cancelled", "confirmed"],
+            "date_range": "Últimos 7 días"
+        },
         "vendor_info": {
             "name": f"{current_user['first_name']} {current_user['last_name']}",
             "location_id": current_user['location_id']
         },
         "last_updated": datetime.now().isoformat()
+    }
+
+
+# ==================== ENDPOINT ADICIONAL: DEBUG TRANSFERENCIAS ====================
+
+@app.get("/api/v1/vendor/debug-transfers")
+async def debug_user_transfers(current_user = Depends(get_current_user)):
+    """Endpoint de debugging para ver todas las transferencias del usuario"""
+    
+    if current_user['role'] not in ['seller', 'administrador']:
+        raise HTTPException(status_code=403, detail="Solo vendedores")
+    
+    if USE_POSTGRESQL:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DB_PATH)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        cursor.execute('''
+            SELECT id, status, requested_at, confirmed_reception_at, cancelled_at,
+                   sneaker_reference_code, brand, model, size, quantity, purpose
+            FROM transfer_requests 
+            WHERE requester_id = %s
+            ORDER BY requested_at DESC
+            LIMIT 20
+        ''', (current_user['id'],))
+        
+        transfers = [dict(row) for row in cursor.fetchall()]
+        
+        # Estadísticas por estado
+        cursor.execute('''
+            SELECT status, COUNT(*) as count
+            FROM transfer_requests 
+            WHERE requester_id = %s
+            GROUP BY status
+            ORDER BY count DESC
+        ''', (current_user['id'],))
+        
+        status_stats = [dict(row) for row in cursor.fetchall()]
+        
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute('''
+            SELECT id, status, requested_at, confirmed_reception_at, cancelled_at,
+                   sneaker_reference_code, brand, model, size, quantity, purpose
+            FROM transfer_requests 
+            WHERE requester_id = ?
+            ORDER BY requested_at DESC
+            LIMIT 20
+        ''', (current_user['id'],))
+        
+        transfers = [dict(row) for row in cursor.fetchall()]
+        
+        cursor = conn.execute('''
+            SELECT status, COUNT(*) as count
+            FROM transfer_requests 
+            WHERE requester_id = ?
+            GROUP BY status
+            ORDER BY count DESC
+        ''', (current_user['id'],))
+        
+        status_stats = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    return {
+        "success": True,
+        "user_id": current_user['id'],
+        "user_name": f"{current_user['first_name']} {current_user['last_name']}",
+        "recent_transfers": transfers,
+        "status_statistics": status_stats,
+        "total_transfers": len(transfers),
+        "debug_timestamp": datetime.now().isoformat()
     }
 
 
