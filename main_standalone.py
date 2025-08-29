@@ -5230,12 +5230,12 @@ def process_delivery_confirmation(request_id: int, user_id: int, actor_type: str
 
 @app.get("/api/v1/vendor/pending-transfers")
 async def get_pending_transfers_with_pickup_context(current_user = Depends(get_current_user)):
-    """VE003: Ver transferencias pendientes - MODIFICADO para flujo simplificado"""
+    """VE003: Ver transferencias pendientes - CORREGIDO con imagen y precio"""
     
     if current_user['role'] not in ['seller', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo vendedores pueden ver sus transferencias pendientes")
     
-    # Query existente sin cambios
+    # Query existente con JOIN completo
     if USE_POSTGRESQL:
         import psycopg2
         import psycopg2.extras
@@ -5263,7 +5263,7 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
             LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
             LEFT JOIN users c ON tr.courier_id = c.id
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
-                                   AND p.location_name = sl.name)
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
             WHERE tr.requester_id = %s 
             AND tr.status IN ('pending', 'accepted', 'courier_assigned', 'in_transit', 'delivered')
             ORDER BY 
@@ -5278,7 +5278,7 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
         ''', (current_user['id'],))
         transfers = [dict(row) for row in cursor.fetchall()]
     else:
-        # SQLite version similar
+        # SQLite version
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         
@@ -5303,7 +5303,7 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
             LEFT JOIN users wk ON tr.warehouse_keeper_id = wk.id
             LEFT JOIN users c ON tr.courier_id = c.id
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
-                                   AND p.location_name = sl.name)
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
             WHERE tr.requester_id = ? 
             AND tr.status IN ("pending", "accepted", "courier_assigned", "in_transit", "delivered")
             ORDER BY 
@@ -5320,13 +5320,13 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
     
     conn.close()
     
-    # CAMBIO: Nueva lógica de procesamiento según pickup_type
+    # PROCESAMIENTO COMPLETO CON CORRECCIONES
     for transfer in transfers:
         # Obtener info del ejecutor
         executor_info = get_transfer_executor_info(transfer)
         transfer.update(executor_info)
         
-        # Cálculos de tiempo (código existente sin cambios)
+        # Cálculos de tiempo
         now = datetime.now()
         if transfer['requested_at']:
             try:
@@ -5336,7 +5336,7 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
             except:
                 transfer['hours_since_request'] = 0
         
-        # CAMBIO: Estado detallado CON FLUJO SIMPLIFICADO
+        # Estado detallado CON FLUJO SIMPLIFICADO
         status = transfer['status']
         is_self_pickup = transfer['is_self_pickup']
         
@@ -5376,8 +5376,6 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
                     "progress_percentage": 30
                 }
         
-        # ELIMINADO: caso 'courier_assigned' para self_pickup (ya no existe)
-        
         elif status == 'courier_assigned':
             # Solo para corredor
             transfer['status_info'] = {
@@ -5389,8 +5387,6 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
                 "next_step": "Corredor recogerá el producto",
                 "progress_percentage": 50
             }
-        
-        # ELIMINADO: caso 'in_transit' para self_pickup (ya no existe)
         
         elif status == 'in_transit':
             # Solo para corredor
@@ -5416,7 +5412,7 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
                 "action_endpoint": f"/api/v1/vendor/confirm-reception/{transfer['id']}"
             }
         
-        # Información del producto y ubicaciones (código existente sin cambios)
+        # ✅ INFORMACIÓN DEL PRODUCTO CORREGIDA
         transfer['product_info'] = {
             "reference_code": transfer['sneaker_reference_code'],
             "brand": transfer['brand'],
@@ -5424,10 +5420,13 @@ async def get_pending_transfers_with_pickup_context(current_user = Depends(get_c
             "size": transfer['size'],
             "quantity": transfer['quantity'],
             "color": transfer['product_color'] or "Varios",
-            "price": float(transfer['product_price']) if transfer['product_price'] else 0.0,
-            "image": transfer['product_image'] or f"https://via.placeholder.com/300x200?text={transfer['brand']}+{transfer['model']}"
+            "price": float(transfer['product_price']) if transfer['product_price'] else 0.0,  # ✅ CORREGIDO
+            "total_value": (float(transfer['product_price']) if transfer['product_price'] else 0.0) * transfer['quantity'],
+            "image": transfer['product_image'] or f"https://via.placeholder.com/300x200?text={transfer['brand']}+{transfer['model']}",  # ✅ CORREGIDO
+            "full_description": f"{transfer['brand']} {transfer['model']} - Talla {transfer['size']}"
         }
         
+        # Información de ubicaciones
         transfer['location_info'] = {
             "from": {
                 "name": transfer['source_location_name'],
@@ -7957,12 +7956,12 @@ async def get_pending_transfer_requests(current_user = Depends(get_current_user)
 
 @app.get("/api/v1/warehouse/accepted-requests")
 async def get_accepted_transfer_requests(current_user = Depends(get_current_user)):
-    """BG002: Ver solicitudes aceptadas y en preparación - MODIFICADO para flujo simplificado"""
+    """BG002: Ver solicitudes aceptadas y en preparación - CORREGIDO con imagen y precio"""
     
     if current_user['role'] not in ['bodeguero', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo bodegueros pueden ver solicitudes aceptadas")
     
-    # Obtener ubicaciones gestionadas para información adicional
+    # Obtener ubicaciones gestionadas
     managed_locations = get_user_managed_locations(current_user['id'], 'bodeguero')
     
     if USE_POSTGRESQL:
@@ -7981,6 +7980,7 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
                    c.last_name as courier_last_name,
                    p.image_url as product_image,
                    p.unit_price as product_price,
+                   p.box_price as product_box_price,
                    p.color_info as product_color
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
@@ -7988,9 +7988,9 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
             JOIN locations dl ON tr.destination_location_id = dl.id
             LEFT JOIN users c ON tr.courier_id = c.id
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
-                                   AND p.location_name = sl.name)
-            WHERE tr.status IN ('accepted', 'courier_assigned', 'in_transit')
-            AND tr.warehouse_keeper_id = %s
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
+            WHERE tr.warehouse_keeper_id = %s 
+            AND tr.status IN ('accepted', 'courier_assigned', 'in_transit')
             ORDER BY 
                 CASE tr.status 
                     WHEN 'accepted' THEN 1 
@@ -8014,6 +8014,7 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
                    c.last_name as courier_last_name,
                    p.image_url as product_image,
                    p.unit_price as product_price,
+                   p.box_price as product_box_price,
                    p.color_info as product_color
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
@@ -8021,9 +8022,9 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
             JOIN locations dl ON tr.destination_location_id = dl.id
             LEFT JOIN users c ON tr.courier_id = c.id
             LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
-                                   AND p.location_name = sl.name)
-            WHERE tr.status IN ("accepted", "courier_assigned", "in_transit")
-            AND tr.warehouse_keeper_id = ?
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
+            WHERE tr.warehouse_keeper_id = ? 
+            AND tr.status IN ("accepted", "courier_assigned", "in_transit")
             ORDER BY 
                 CASE tr.status 
                     WHEN "accepted" THEN 1 
@@ -8036,8 +8037,9 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
     
     conn.close()
     
-    # CAMBIO: Nueva lógica de estado según pickup_type
+    # PROCESAMIENTO CORREGIDO con imagen fallback y precio
     for request in requests:
+        # Lógica de estado según pickup_type
         if request['pickup_type'] == 'seller' and request['status'] == 'accepted':
             request['status_description'] = 'Listo para entregar al vendedor'
             request['action_available'] = True
@@ -8057,9 +8059,23 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
             request['action_available'] = False
             request['ready_for_pickup'] = False
         
-        # Imagen fallback
-        if not request['product_image']:
+        # ✅ CORRECCIÓN: Imagen fallback
+        if not request.get('product_image'):
             request['product_image'] = f"https://via.placeholder.com/300x200?text={request['brand']}+{request['model']}"
+        
+        # ✅ CORRECCIÓN: Información del producto con precio
+        request['product_info'] = {
+            "reference_code": request['sneaker_reference_code'],
+            "brand": request['brand'],
+            "model": request['model'],
+            "size": request['size'],
+            "quantity": request['quantity'],
+            "color": request['product_color'] or "Varios",
+            "unit_price": float(request['product_price']) if request['product_price'] else 0.0,
+            "box_price": float(request['product_box_price']) if request['product_box_price'] else 0.0,
+            "total_value": (float(request['product_price']) if request['product_price'] else 0.0) * request['quantity'],
+            "image_url": request['product_image']
+        }
     
     return {
         "success": True,
@@ -8078,7 +8094,6 @@ async def get_accepted_transfer_requests(current_user = Depends(get_current_user
             "location_names": [loc['location_name'] for loc in managed_locations]
         }
     }
-
 
 @app.get("/api/v1/vendor/my-pickup-assignments")
 async def get_vendor_pickup_assignments(current_user = Depends(get_current_user)):
@@ -8902,7 +8917,7 @@ async def accept_courier_request(
 
 @app.get("/api/v1/courier/my-assigned-transports")
 async def get_my_assigned_transports(current_user = Depends(get_current_user)):
-    """Ver transportes específicamente asignados a este corredor"""
+    """Ver transportes específicamente asignados a este corredor - CORREGIDO con imagen y precio"""
     
     if current_user['role'] not in ['corredor', 'administrador']:
         raise HTTPException(status_code=403, detail="Solo corredores")
@@ -8918,11 +8933,19 @@ async def get_my_assigned_transports(current_user = Depends(get_current_user)):
                    u.first_name as requester_first_name,
                    u.last_name as requester_last_name,
                    sl.name as source_location_name,
-                   dl.name as destination_location_name
+                   sl.address as source_address,
+                   dl.name as destination_location_name,
+                   dl.address as destination_address,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.box_price as product_box_price,
+                   p.color_info as product_color
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
             WHERE tr.courier_id = %s 
             AND tr.status IN ('courier_assigned', 'in_transit', 'delivered')
             ORDER BY 
@@ -8943,12 +8966,20 @@ async def get_my_assigned_transports(current_user = Depends(get_current_user)):
                    u.first_name as requester_first_name,
                    u.last_name as requester_last_name,
                    sl.name as source_location_name,
-                   dl.name as destination_location_name
+                   sl.address as source_address,
+                   dl.name as destination_location_name,
+                   dl.address as destination_address,
+                   p.image_url as product_image,
+                   p.unit_price as product_price,
+                   p.box_price as product_box_price,
+                   p.color_info as product_color
             FROM transfer_requests tr
             JOIN users u ON tr.requester_id = u.id
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
-            WHERE tr.courier_id = ? 
+            LEFT JOIN products p ON (tr.sneaker_reference_code = p.reference_code 
+                                   AND UPPER(p.location_name) = UPPER(sl.name))
+            WHERE tr.courier_id = ?
             AND tr.status IN ("courier_assigned", "in_transit", "delivered")
             ORDER BY 
                 CASE tr.status 
@@ -8962,8 +8993,9 @@ async def get_my_assigned_transports(current_user = Depends(get_current_user)):
     
     conn.close()
     
-    # Agregar información de acción requerida
+    # ✅ PROCESAMIENTO CORREGIDO con imagen y precio
     for transport in transports:
+        # Información de acción requerida
         if transport['status'] == 'courier_assigned':
             transport['action_required'] = "ir_a_recoger"
             transport['action_description'] = "Ve al punto de recolección"
@@ -8973,6 +9005,36 @@ async def get_my_assigned_transports(current_user = Depends(get_current_user)):
         elif transport['status'] == 'delivered':
             transport['action_required'] = "completado"
             transport['action_description'] = "Esperando confirmación del vendedor"
+        
+        # ✅ CORRECCIÓN: Imagen fallback
+        if not transport.get('product_image'):
+            transport['product_image'] = f"https://via.placeholder.com/300x200?text={transport['brand']}+{transport['model']}"
+        
+        # ✅ CORRECCIÓN: Información completa del producto
+        transport['product_info'] = {
+            "reference_code": transport['sneaker_reference_code'],
+            "brand": transport['brand'],
+            "model": transport['model'],
+            "size": transport['size'],
+            "quantity": transport['quantity'],
+            "color": transport['product_color'] or "Varios",
+            "unit_price": float(transport['product_price']) if transport['product_price'] else 0.0,
+            "box_price": float(transport['product_box_price']) if transport['product_box_price'] else 0.0,
+            "total_value": (float(transport['product_price']) if transport['product_price'] else 0.0) * transport['quantity'],
+            "image_url": transport['product_image']
+        }
+        
+        # Información de ubicaciones
+        transport['location_info'] = {
+            "pickup": {
+                "name": transport['source_location_name'],
+                "address": transport['source_address'] or "Dirección no disponible"
+            },
+            "delivery": {
+                "name": transport['destination_location_name'],
+                "address": transport['destination_address'] or "Dirección no disponible"
+            }
+        }
     
     return {
         "success": True,
@@ -8982,6 +9044,10 @@ async def get_my_assigned_transports(current_user = Depends(get_current_user)):
             "ready_for_pickup": len([t for t in transports if t['status'] == 'courier_assigned']),
             "in_transit": len([t for t in transports if t['status'] == 'in_transit']),
             "awaiting_confirmation": len([t for t in transports if t['status'] == 'delivered'])
+        },
+        "courier_info": {
+            "name": f"{current_user['first_name']} {current_user['last_name']}",
+            "courier_id": current_user['id']
         }
     }
 
