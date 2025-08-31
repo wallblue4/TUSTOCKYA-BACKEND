@@ -8836,7 +8836,6 @@ async def get_available_courier_requests_filtered(current_user = Depends(get_cur
             AND (
                 (tr.status = 'accepted' AND tr.courier_id IS NULL)
                 )
-            )
             ORDER BY 
                 CASE WHEN tr.purpose = 'cliente' THEN 1 ELSE 2 END,
                 tr.accepted_at ASC
