@@ -8356,7 +8356,7 @@ async def deliver_to_vendor(
         cursor.execute('''
             SELECT * FROM transfer_requests 
             WHERE id = %s AND status = 'accepted' 
-            AND pickup_type = 'seller'
+            AND pickup_type = 'vendedor'
             AND warehouse_keeper_id = %s
         ''', (transfer_id, current_user['id']))
         request = cursor.fetchone()
