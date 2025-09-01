@@ -4445,7 +4445,7 @@ async def get_courier_delivery_history(current_user = Depends(get_current_user))
             JOIN locations sl ON tr.source_location_id = sl.id
             JOIN locations dl ON tr.destination_location_id = dl.id
             JOIN users u ON tr.requester_id = u.id
-            WHERE tr.courier_id = %s
+            WHERE tr.courier_id = %s AND tr.delivered_at::DATE = CURRENT_DATE
             ORDER BY tr.delivered_at DESC NULLS LAST, tr.picked_up_at DESC
         ''', (current_user['id'],))
         deliveries = [dict(row) for row in cursor.fetchall()]
