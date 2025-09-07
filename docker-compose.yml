@@ -1,5 +1,4 @@
 # docker-compose.yml - Puerto libre
-version: '3.8'
 
 services:
   # PostgreSQL
